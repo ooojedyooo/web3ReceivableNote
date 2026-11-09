@@ -1,0 +1,17 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+# 环境变量（私钥绝对不能提交）
+.env
+.env.local
+
+# 依赖（用 forge install 重新拉取即可）
+lib/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

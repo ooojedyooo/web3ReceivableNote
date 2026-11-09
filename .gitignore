@@ -1,0 +1,23 @@
+# ---------- Foundry 生成物 ----------
+# 各子工程里已有各自的 .gitignore，这里兜底一份，防止漏网
+out/
+cache/
+broadcast/
+lib/
+
+# ---------- 环境变量（私钥绝对不能提交）----------
+.env
+.env.local
+.env.*.local
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---------- 本地实验工程 ----------
+# 第 12 / 13 讲的临时测试台，讲义里有 10 处引用 code/syntax-lab/。
+# 如需让这些引用可点开，删掉下面这一行再 git add 即可。
+code/syntax-lab/

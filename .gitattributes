@@ -1,0 +1,5 @@
+# 仓库内统一存 LF；shell 脚本强制按 LF 签出，
+# 否则在 WSL / Linux / macOS 上会报 $'\r': command not found
+*.sh text eol=lf
+
+# 其余文本走 git 默认的自动检测（仓库内仍是 LF，Windows 签出为 CRLF）
