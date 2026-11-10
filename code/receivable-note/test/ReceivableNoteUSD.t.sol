@@ -243,17 +243,28 @@ contract ReceivableNoteUSDTest is Test {
         assertEq(uint8(note.getNote(id).status), uint8(ReceivableNoteUSD.Status.Redeemed));
     }
 
-    /* ==================== 8. 贴现息的历史可查性（discountYieldBps 修复） ==================== */
+    /* ==================== 8. 贴现息的历史可查性 + 年化不漂移 ==================== */
 
-    /// @notice 回归：兑付之后，这张票的贴现息必须还能查到。
+    /// @dev 合同年化的期望值。termDays 是**合同期限**，不是"现在还剩几天"。
+    function _expectedBps(uint256 face, uint256 paid, uint256 termDays)
+        internal
+        pure
+        returns (uint256)
+    {
+        return ((face - paid) * 365 * 10_000) / (paid * termDays);
+    }
+
+    /// @notice 回归：兑付之后，贴现息和年化都必须还能查到。
     ///         修复前判据写的是 status != Discounted，一兑付就返回 (0,0)，
     ///         财务报表里 2 万的贴现收益凭空消失。
-    ///         锁两件事：interest 活下来（永久事实），bps 归零（分母没了）。
     function test_YieldBps_StillQueryableAfterRedeem() public {
         uint256 id = _issue(uint96(FACE));
         _approve(bank, PAY);
         vm.prank(supplierA);
         note.discount(id, bank, uint96(PAY));
+
+        (uint256 interestDay0, uint256 bpsDay0) = note.discountYieldBps(id);
+        assertEq(interestDay0, FACE - PAY, "day0: interest");
 
         vm.warp(due + 1);
         _approve(core, FACE);
@@ -265,7 +276,7 @@ contract ReceivableNoteUSDTest is Test {
         console.log(unicode"兑付后年化(bps) :", bps);
 
         assertEq(interest, FACE - PAY, "after redeem: interest is permanent");
-        assertEq(bps, 0, "after redeem: bps has no denominator");
+        assertEq(bps, bpsDay0, "after redeem: bps stays frozen at contract rate");
     }
 
     /// @notice 回归：逾期未兑付 —— 旧代码在这里会 Panic(0x11)。
@@ -281,6 +292,28 @@ contract ReceivableNoteUSDTest is Test {
 
         (uint256 interest, uint256 bps) = note.discountYieldBps(id);
         assertEq(interest, FACE - PAY, "overdue: interest still there");
-        assertEq(bps, 0, "overdue: bps = 0, no panic");
+        assertEq(bps, _expectedBps(FACE, PAY, 90), "overdue: bps frozen, no panic");
+    }
+
+    /// @notice 本轮修正的核心：bps 不随时间漂移。
+    ///         旧实现分母是 dueDate − now，同一张票在贴现后 89 天会算出 112,886 bps。
+    function test_YieldBps_DoesNotDriftOverTime() public {
+        uint256 id = _issue(uint96(FACE));
+        _approve(bank, PAY);
+        vm.prank(supplierA);
+        note.discount(id, bank, uint96(PAY));
+
+        assertEq(note.getNote(id).discountTermDays, 90, "term days persisted");
+
+        uint256 expected = _expectedBps(FACE, PAY, 90);
+        assertEq(expected, 827, "100w face / 98w paid / 90d = 827 bps");
+
+        vm.warp(block.timestamp + 45 days);
+        (, uint256 bpsDay45) = note.discountYieldBps(id);
+        assertEq(bpsDay45, expected, "day 45 must not drift");
+
+        vm.warp(due + 100 days);
+        (, uint256 bpsAfter) = note.discountYieldBps(id);
+        assertEq(bpsAfter, expected, "after due: still frozen");
     }
 }

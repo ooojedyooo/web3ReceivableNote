@@ -66,6 +66,16 @@ contract ReceivableNoteRegistryTest is Test {
         return uint8(note.getNote(id).status);
     }
 
+    /// @dev 合同年化的期望值，三条测试共用。参数里的 termDays 是**合同期限**，
+    ///      不是"现在还剩几天"——这是本轮修正的核心，写在这里提醒后来者别传错。
+    function _expectedBps(uint96 face, uint96 paid, uint256 termDays)
+        internal
+        pure
+        returns (uint256)
+    {
+        return (uint256(face - paid) * 365 * 10_000) / (uint256(paid) * termDays);
+    }
+
     /* ---------------- 1. 状态机全流程 ---------------- */
 
     /// @dev 一条测试走完 5 步，验证存证版和前两版的状态机完全一致
@@ -294,17 +304,15 @@ contract ReceivableNoteRegistryTest is Test {
         assertGt(bps, 0, "bps must be positive");
     }
 
-    /// @dev 回归测试①：结算之后还能不能查到贴现息。
-    ///      修复前的判据是 status != Discounted，一结算就返回 (0,0)，
-    ///      于是所有「历史业绩统计」在票据结清那一刻集体归零。
-    ///      这里同时锁死两件事：interest 必须活下来，bps 必须归零（分母没了）。
+    /// @dev 回归测试①：结算之后还能不能查到贴现息和年化。
+    ///      修复前的判据是 status != Discounted，一结算就返回 (0,0)。
+    ///      现在：interest 和 bps 都必须活着，而且 bps 与贴现当天完全一致。
     function test_YieldBps_StillQueryableAfterSettle() public {
         uint256 id = _issueConfirmed();
         vm.prank(supplierA);
         note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
 
-        // 贴现当天先取一份，作为「当时的报价」
-        (uint256 interestOnDay0,) = note.discountYieldBps(id);
+        (uint256 interestOnDay0, uint256 bpsOnDay0) = note.discountYieldBps(id);
         assertEq(interestOnDay0, FACE - DISCOUNT_PRICE, "day0: interest");
 
         vm.warp(dueDate);
@@ -313,13 +321,13 @@ contract ReceivableNoteRegistryTest is Test {
 
         (uint256 interest, uint256 bps) = note.discountYieldBps(id);
         assertEq(interest, FACE - DISCOUNT_PRICE, "after settle: interest is permanent");
-        assertEq(bps, 0, "after settle: bps has no denominator");
+        assertEq(bps, bpsOnDay0, "after settle: bps stays frozen at contract rate");
     }
 
-    /// @dev 回归测试②：逾期未结算 —— 这是旧代码真正会 Panic 的场景。
+    /// @dev 回归测试②：逾期未结算 —— 旧代码在这里会 Panic(0x11)。
     ///      旧逻辑只拦「status 不是 Discounted」，而逾期的票恰好还是 Discounted，
-    ///      于是 `dueDate - block.timestamp` 直接下溢 → Panic(0x11)。
-    ///      注意这里**不结算**，就是让票据挂在逾期状态上挨查。
+    ///      于是 `dueDate - block.timestamp` 直接下溢。
+    ///      现在分母是贴现日钉住的期限，时间怎么走都影响不到它。
     function test_YieldBps_OverdueDoesNotPanic() public {
         uint256 id = _issueConfirmed();
         vm.prank(supplierA);
@@ -329,7 +337,7 @@ contract ReceivableNoteRegistryTest is Test {
 
         (uint256 interest, uint256 bps) = note.discountYieldBps(id);
         assertEq(interest, FACE - DISCOUNT_PRICE, "overdue: interest still there");
-        assertEq(bps, 0, "overdue: bps = 0, no panic");
+        assertEq(bps, _expectedBps(FACE, DISCOUNT_PRICE, 90), "overdue: bps frozen, no panic");
     }
 
     /// @dev 回归测试③：从没贴现过 → (0,0)，不 revert。
@@ -340,6 +348,53 @@ contract ReceivableNoteRegistryTest is Test {
         (uint256 interest, uint256 bps) = note.discountYieldBps(id);
         assertEq(interest, 0, "never discounted: interest = 0");
         assertEq(bps, 0, "never discounted: bps = 0");
+    }
+
+    /// @dev 回归测试④（本轮修正的核心）：bps 必须**不随时间漂移**。
+    ///      旧实现的分母是 `dueDate − now`，同一张票实测会走出这样一条曲线：
+    ///        贴现当天 1254 → 贴现后 45 天 2508 → 贴现后 89 天 112,886（1128.9%）→ 到期后 0
+    ///      这不是收益率，是"假设今天还能用原价买到这张票"的假想值。
+    ///      现在分母是贴现当天写进 storage 的 discountTermDays，任何时刻都必须是同一个数。
+    function test_YieldBps_DoesNotDriftOverTime() public {
+        uint256 id = _issueConfirmed();
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
+
+        // 贴现那一刻的期限被钉住（票面 100 万 / 实付 97 万 / 90 天）
+        assertEq(note.getNote(id).discountTermDays, 90, "term days persisted at discount time");
+
+        uint256 expected = _expectedBps(FACE, DISCOUNT_PRICE, 90);
+
+        (, uint256 bpsDay0) = note.discountYieldBps(id);
+        assertEq(bpsDay0, expected, "day 0 = 1254");
+
+        vm.warp(block.timestamp + 45 days);
+        (, uint256 bpsDay45) = note.discountYieldBps(id);
+        assertEq(bpsDay45, expected, "day 45 must not drift (old code: 2508)");
+
+        vm.warp(dueDate - 1);
+        (, uint256 bpsDay89) = note.discountYieldBps(id);
+        assertEq(bpsDay89, expected, "day 89 must not explode (old code: 112886)");
+
+        vm.warp(dueDate + 100 days);
+        (, uint256 bpsAfter) = note.discountYieldBps(id);
+        assertEq(bpsAfter, expected, "after due: still frozen (old code: 0)");
+    }
+
+    /// @dev 边界：贴现时就已不足一天到期 → 期限取整为 0 → 年化没有分母。
+    ///      此时返回 (interest, 0)：息算得出来，年化算不出来，不该 revert。
+    function test_YieldBps_ZeroTermWhenDiscountedInLastHours() public {
+        uint256 id = _issueConfirmed();
+
+        vm.warp(dueDate - 12 hours); // 距到期只剩半天，除下来是 0 天
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
+
+        assertEq(note.getNote(id).discountTermDays, 0, "term rounds down to 0");
+
+        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest still computable");
+        assertEq(bps, 0, "no denominator, bps = 0");
     }
 
     /// @dev 完整演示「链下怎么从两条事件算出实际年化」——这是加两个时间戳的唯一目的。
