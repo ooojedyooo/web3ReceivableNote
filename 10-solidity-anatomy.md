@@ -60,6 +60,7 @@
 | 24 | 事件测试怎么写？`vm.expectEmit` 那四个 `bool` 各检查什么 | §11.5·提问 24 |
 | 25 | `modifier` 的参数有什么限制？它和被修饰的函数是什么关系 | §7.9 末尾·提问 25 |
 | 26 | modifier 要 2 个参数、函数只有 0 或 1 个参数会编译失败吗？顺序反了呢 | §7.9 末尾·提问 26 |
+| 27 | `_notes[id].x = v` 和 `Note storage n = _notes[id]; n.x = v` 有本质区别吗 | §9.5 末尾·提问 27 |
 
 ---
 
@@ -2575,6 +2576,83 @@ if (payAmount >= faceValue) revert DiscountTooHigh(payAmount, faceValue);
 注释写得很清楚：`payAmount` 那笔钱走链下或另接稳定币合约。为什么？因为把"凭证登记"和"资金清算"耦合在一起，会让合约同时承担两类风险。RWA 项目的通行做法是拆成两个合约，各管一段。
 
 第 9 讲的 `ReceivableNoteUSD.sol` 就是把它接上稳定币的版本。
+
+#### ❓ 提问 27：`_notes[id].holder = x` 和 `Note storage n = _notes[id]; n.holder = x;` 有本质区别吗
+
+**结论：语义零差别，gas 几乎零差别（实测差 26 / 59,417 ≈ 0.04%）。区别只在可读性。**
+
+### 一、为什么等价：`storage` 是别名，不是拷贝
+
+```solidity
+Note storage n = _notes[id];   // n 指向 _notes[id] 那块存储，而不是复制一份
+n.holder = financier;          // 写 n，就是写 _notes[id]
+```
+
+`n` 本身不占存储，它只是一个"门牌号"。三种写法对照：
+
+| 写法 | 本质 | 改完链上有变化吗 |
+| --- | --- | --- |
+| `_notes[id].holder = x;` | 直接写 storage | ✅ |
+| `Note storage n = _notes[id]; n.holder = x;` | **别名**，写的还是 storage | ✅ |
+| `Note memory n = _notes[id]; n.holder = x;` | **拷贝到内存** | ❌ 除非再整体写回 |
+
+第三行就是提问 19 讲过的坑：`memory` 版本改完不写回，链上什么都没发生，**而且编译器一个字都不报**。
+
+### 二、gas 实测：差 26，等于没差
+
+对照组条件完全一致（同一 struct、同一初始状态、同样 3 个字段的读写）：
+
+| 写法 | gas |
+| --- | --- |
+| `_notes[id]` 出现 4 次 | **59,417** |
+| `Note storage n` 1 次 + `n.` 4 次 | **59,391** |
+| 差 | **26 gas（0.04%）** |
+
+连跑三次，数字完全一致。
+
+原因：编译器会**自己**把同一个 `_notes[id]` 的槽位计算结果复用（公共子表达式消除），你手写 `storage` 引用并没有额外省下什么。
+
+> **所以：不要为了"省 gas"去加 `storage` 引用。**
+
+唯一的例外是**横跨外部调用**的场景（`call` / `transferFrom`）——那时编译器不敢复用，因为对方可能改了 storage。但那种地方你该关心的是 CEI 顺序（§9.6），不是这几十 gas。
+
+### 三、那为什么项目里两种写法都有？纯可读性
+
+| 位置 | 写法 | 同一张票的字段访问次数 |
+| --- | --- | --- |
+| `discount`（ETH 版） | 直接 `_notes[id]` | 4 次 |
+| `discount`（USD 版） | `Note storage n` | 6 次（多 `discountPrice` 的读/写） |
+| `redeem` | `Note storage n` | 6 次以上 |
+
+规律：**改一两个字段就直接写；要反复读写同一张票，先取别名。**
+
+`_notes[id].` 重复六次，读代码的人得在六个地方确认"id 是不是同一个"；写成 `n.` 之后，整个函数只在开头一行交代"我操作的是这张票"。
+
+### 四、一个容易误解的语义细节：`storage` 引用**不缓存值**
+
+```solidity
+Note storage n = _notes[id];
+// …中间调用外部合约，对方可能改了 _notes[id]…
+uint96 v = n.amount;   // ← 读的是「此刻」storage 里的值，不是取别名那一刻的值
+```
+
+这和"把字段缓存到局部变量"是两件事：
+
+```solidity
+uint96 cached = _notes[id].amount;   // 值被固定在当前这一刻
+// …外部调用…
+uint96 v = cached;                   // ← 仍然是旧值
+```
+
+`redeem` 里那句 `uint96 amount = n.amount;` 就是**故意**做值缓存——转账金额必须在 `call` 之前定下来。这个区分在 CEI 顺序里是关键（§9.6）。
+
+### 五、什么时候**必须**用 `storage` 引用
+
+如果 struct 里有 `mapping` 或动态数组字段，`memory` 版本**根本不允许**（mapping 不能存在于 memory 中）。这种 struct 只能用 `storage` 引用操作。
+
+本项目三个合约的 `Note` 都没有这类字段，所以两种写法随便选。
+
+> **一句话：`storage` 是「别名」，`memory` 是「复印件」。别名改完自然生效，复印件不寄回去等于没改。**
 
 ---
 

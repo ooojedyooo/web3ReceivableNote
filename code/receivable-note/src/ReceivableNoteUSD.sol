@@ -405,6 +405,10 @@ contract ReceivableNoteUSD {
         _requireCanPull(financier, payAmount);
 
         // --- Effects ---
+        // 这一版比 ETH 版多一个 discountPrice 字段要写，同一张票要碰 6 次，
+        // 所以取 `Note storage n` 别名（别名 = 门牌号，不是拷贝，写 n 就是写 _notes[id]）。
+        // 对照 ETH 版的 discount()：那里只动 3 个字段，就直接写 _notes[id]。
+        // 两者语义等价、gas 只差 26，见第 10 讲提问 27。
         Note storage n = _notes[id];
         address holder = n.holder;
         n.holder = financier;

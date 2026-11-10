@@ -345,6 +345,9 @@ contract ReceivableNote {
         if (payAmount == 0) revert ZeroAmount();
         if (payAmount >= faceValue) revert DiscountTooHigh(payAmount, faceValue);
 
+        // 只动 3 个字段，所以直接写 `_notes[id]`，不取 `Note storage n` 别名。
+        // 对照下面 redeem()：那里要读写 6 个字段，取了 n 更好读。
+        // 两者语义完全等价、gas 只差 26（可忽略），纯粹是可读性选择 —— 详见第 10 讲提问 27。
         address from = _notes[id].holder;
         _notes[id].holder = financier;
         _notes[id].status = Status.Discounted;
