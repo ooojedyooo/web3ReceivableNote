@@ -562,6 +562,12 @@ contract ReceivableNoteRegistry {
     ///      全部整数运算，最后向下取整 —— 链上没有小数，任何「保留两位」都是展示层的事。
     ///      注意整除顺序：先算 daysLeft 再乘，是为了得到「整天数」；财务按天计息，
     ///      精确到秒的剩余时间反而是噪声。
+    ///
+    ///      三个数的归属别搞混（以票面 100 万、实付 98 万为例）：
+    ///        amount         = 100 万 → 核心企业欠的钱，到期 redeem 才付
+    ///        discountPrice  =  98 万 → 银行付给持票人的钱，discount 那一刻就出去了
+    ///        interest       =   2 万 → 银行赚的钱（贴现息），不是给供应商的钱
+    ///      算收益率的分母永远是「我掏出去的本金」，也就是 discountPrice。
     function discountYieldBps(uint256 id) external view returns (uint256 interest, uint256 bps) {
         Note storage n = _notes[id];
         if (n.status != Status.Discounted) return (0, 0);
@@ -570,8 +576,15 @@ contract ReceivableNoteRegistry {
         uint256 daysLeft = (n.dueDate - block.timestamp) / 1 days;
         // forge-lint: disable-next-line(block-timestamp)
         if (daysLeft == 0 || n.discountPrice == 0) return (interest, 0);
+        // ↓ 括号不是排版偏好，是「能不能算出正确结果」：
+        //   若按公式字面从左到右写成 interest / discountPrice * 365 / daysLeft * 10000，
+        //   第一刀 20000/980000 就被整数除法截成 0，后面乘什么都还是 0。
+        //   所以把乘法全凑到分子、除法只留这最后一次。代价是中间值变大，
+        //   需确认不溢出：uint96 上限 × 365 × 10000 ≈ 2.9e35 << uint256 上限 1.16e77。
         // forge-lint: disable-next-line(divide-before-multiply) daysLeft 已是整天数，此处不再除
         bps = (interest * 365 * 10_000) / (n.discountPrice * daysLeft);
+        // 注意本函数结果不幂等：daysLeft 随 block.timestamp 变小，bps 会逐日变大。
+        // 所以它是派生量，永远不写进 storage；留档只留 interest 与 discountPrice。
     }
 
     /// @notice 取结算回执。链下核验时拿它和银行流水对照

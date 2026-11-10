@@ -572,6 +572,15 @@ contract ReceivableNoteUSD {
     /// @dev 年化 = 贴现息 / 实付金额 × 365 / 剩余天数 × 10000
     ///      全部整数运算，最后向下取整 —— 链上没有小数，任何「保留两位」都是展示层的事。
     ///      举例：票面 100 万、实付 97 万、还剩 90 天 → 息 3 万，年化 = 30000×365×10000/(970000×90) ≈ 1254 bps ≈ 12.54%
+    ///
+    ///      三个数的归属别搞混（以票面 100 万、实付 98 万为例）：
+    ///        amount         = 100 万 → 核心企业欠的钱，到期 redeem 才付
+    ///        discountPrice  =  98 万 → 银行付给持票人的钱，discount 那一刻就出去了
+    ///        interest       =   2 万 → 银行赚的钱（贴现息），**不是**给供应商的钱
+    ///      算收益率的分母永远是「我掏出去的本金」，也就是 discountPrice。
+    ///
+    ///      bps 是基点：1 bps = 0.01%，10_000 bps = 100%。末尾那个 ×10_000 就是
+    ///      把 0.0827 这种小数放大成整数 827 —— 链上没有浮点，百分比只能这么存。
     function discountYieldBps(uint256 id) external view returns (uint256 interest, uint256 bps) {
         Note storage n = _notes[id];
         if (n.status != Status.Discounted) return (0, 0);
@@ -582,8 +591,17 @@ contract ReceivableNoteUSD {
         uint256 daysLeft = (n.dueDate - block.timestamp) / 1 days;
         // forge-lint: disable-next-line(block-timestamp)
         if (daysLeft == 0 || n.discountPrice == 0) return (interest, 0);
+        // ↓ 括号不是排版偏好，是「能不能算出正确结果」：
+        //   若按公式字面从左到右写成 interest / discountPrice * 365 / daysLeft * 10000，
+        //   第一刀 20000/980000 就被整数除法截成 0，后面乘什么都还是 0（实测三种写法：
+        //   本式 827 / 从左到右 0 / 只乘一半 0）。
+        //   所以把乘法全凑到分子、除法只留这最后一次。代价是中间值变大，需确认不溢出：
+        //   uint96 上限 × 365 × 10000 ≈ 2.9e35 << uint256 上限 1.16e77。
         // forge-lint: disable-next-line(divide-before-multiply) daysLeft 已是整天数，此处不再除
         bps = (interest * 365 * 10_000) / (n.discountPrice * daysLeft);
+        // 注意本函数结果不幂等：daysLeft 随 block.timestamp 变小，bps 会逐日变大
+        //（90 天时 827，过 45 天变 1655）。所以它是派生量，永远不写进 storage；
+        // 留档只留 interest 与 discountPrice，bps 任何时候都能重算。
     }
 
     /// @dev 依然不实现 receive()/fallback()。但请注意：这只挡住了 ETH。
