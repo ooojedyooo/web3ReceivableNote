@@ -239,6 +239,11 @@ contract ReceivableNoteRegistry {
     // 定义时括号 = 形参列表（无参可省）；使用时括号 = 实参列表（无参时习惯省略）。
     // 它只能出现在「函数签名后面的修饰位」；在函数体里写 onlyCore(); 是编译错误 5704。
     // 多个 modifier 从左到右依次是「越靠左越外层」，最先执行、最后收尾。
+    //
+    // ⚠️ 下面这几个 modifier 的 id 参数，是它**自己的**形参，不是函数的参数。
+    //    modifier 里按名字访问函数参数是编译错误 7576，唯一的通信方式就是这些形参。
+    //    所以 `exists(id)` 里那个 id 是「实参」——在函数签名处对函数的 id 求值后按值传进来。
+    //    两者恰好同名，但是两个独立变量（modifier 里改它不影响函数的 id）。
 
     modifier onlyCore() {
         if (msg.sender != coreEnterprise) revert NotCoreEnterprise();

@@ -58,6 +58,7 @@
 | 22 | `vm.expectRevert` 写在调用上面，真正 revert 的是下面那句——它到底在干什么 | §11.5·提问 22 |
 | 23 | 想判断两个地址不相等该怎么写？为什么那条 `!=` 断言永远不会失败 | §11.5·提问 23 |
 | 24 | 事件测试怎么写？`vm.expectEmit` 那四个 `bool` 各检查什么 | §11.5·提问 24 |
+| 25 | `modifier` 的参数有什么限制？它和被修饰的函数是什么关系 | §7.9 末尾·提问 25 |
 
 ---
 
@@ -1723,6 +1724,90 @@ note.confirm(1);
 - 只在某一个函数用的（直接写 `if` 更清楚，少一层跳转）
 
 **最后一个判断标准很实用**：**如果一个 modifier 只被一个函数用，那它就不该是 modifier。** 因为读代码的人要多跳一次才能看到逻辑，收益是负的。
+
+#### ❓ 提问 25：`modifier` 的参数有什么限制？它和被修饰的函数到底是什么关系
+
+**一句话：函数把自己的参数值当"实参"传进去，除此之外两者毫无关系。**
+
+`modifier` 里的 `id` 是它**自己的**变量，只是恰好和函数参数同名。
+
+```
+function confirm(uint256 id) external exists(id) { ... }
+                    ─────┬────              ──┬─
+                         │                    │
+              函数的形参（第 1 个 id）   实参：在签名处求值
+                                             ↓ 值传递
+modifier exists(uint256 id) { ... }
+                  ─────┬────
+            modifier 自己的形参（第 2 个 id）
+            ← 两个完全独立的变量，同名纯属巧合
+```
+
+### 一、三条实测证据（编译 + 运行）
+
+| 实验 | 写法 | 结果 |
+| --- | --- | --- |
+| 不传就看不见 | `modifier exists()` 里直接写 `id` | ❌ **Error 7576: Undeclared identifier** |
+| 同名不代表同一个 | modifier 形参也叫 `id`，实参传 `id` | ✅ 编译通过，无警告 |
+| 实参可以是表达式 | `record(id * 2)` | ✅ modifier 里拿到 `14`，函数体里的 `id` 仍是 `7` |
+
+**第一条推翻了从 Java/Python 带来的直觉。** Spring 的 `@Around` 能通过 `ProceedingJoinPoint.getArgs()` 读到方法参数，Python 装饰器能拿到被装饰函数的对象——因为它们是**运行时**包装。Solidity 的 modifier 是**编译期内联**（§7.4），它只能拿到你**显式写给它的东西**。
+
+### 二、值拷贝（运行期实测）
+
+```solidity
+modifier record(uint256 x) { x = 99; _; }
+function f(uint256 id) external record(id) returns (uint256) { return id; }
+```
+
+实测：modifier 里 `x` 变成 `99`，函数返回 **7**。**两个是不同的变量，按值拷贝**，和函数之间传参的规则完全一样。
+
+### 三、参数限制全表
+
+| 项目 | 结论 | 依据 |
+| --- | --- | --- |
+| 能不能有参数 | ✅ | `inStatus(uint256 id, Status required)` |
+| 引用类型要不要标 data location | ✅ **必须** | 不标 → **Error 6651** |
+| 能不能是 `storage` 引用 | ✅ 能，且**能直接改状态** | 实测写入成功 |
+| 能不能是 `mapping ... storage` | ✅ 能 | 实测 `mm[7] = 7` 生效 |
+| 参数能不能有默认值 | ❌ Solidity 全文没有默认参数 | 和函数一致 |
+| 参数个数上限 | 无硬上限（25 个编译通过） | 实际受栈深约束，没人会这么写 |
+| 能不能重载（同名不同类型） | ❌ **Error 2333: Identifier already declared** | 参数列表不构成区分 |
+| 能不能有返回值 | ❌ 不能 | modifier 没有返回值这个概念 |
+| modifier 里访问**函数参数** | ❌ **Error 7576** | 必须显式传 |
+| modifier 里访问**函数的命名返回值** | ❌ **Error 7576** | 同上 |
+| modifier 的**局部变量**给函数体用 | ❌ **Error 7576** | 作用域不贯通 |
+| `_;` **之后**还能用参数吗 | ✅ 能 | 参数作用域覆盖整个 modifier 体 |
+
+### 四、一条我原本记错、被实测纠正的行为
+
+**函数体里的 `return` **不会**跳过 `_;` 之后的代码。**
+
+```solidity
+modifier guard() { lock = 1; _; lock = 0; tailRan = 1; }
+function earlyReturn() external guard returns (uint256) { return 7; }
+```
+
+实测结果：`lock == 0`、`tailRan == 1` —— **后置代码照样执行**。
+
+对比 §7.5 第 4 条，两者别混：
+
+| 谁写 `return` | 后果 |
+| --- | --- |
+| **modifier 自己**里写 `return` | 整个函数立刻结束，返回**默认值**（§7.5 第 4 条） |
+| **函数体**里写 `return` | 正常返回值，**modifier 的后置代码照常执行** |
+
+这个行为是 OpenZeppelin `nonReentrant` 能成立的前提——解锁写在 `_;` 之后，函数里随便 `return` 都不会漏解锁。反过来就是灾难。
+
+### 五、三条实用推论
+
+**① 改函数参数名不影响 modifier，但要同步改调用处的实参。** 重命名工具不一定能覆盖到签名里的实参位置。
+
+**② modifier 参数名建议取一个"有含义"的名字。** 比如 `exists(uint256 noteId)` 比 `exists(uint256 id)` 更能提示"这和函数的 `id` 不是同一个东西"。你项目里四个 modifier 全用了同名 `id`，编译无碍、社区也这么写，但读的时候要记住"同名是巧合"。
+
+**③ modifier 无法把东西"返回"给函数体**：不能 return 值、局部变量不可见。唯一通道是写 storage。所以 modifier 只适合做**守卫**（检查 + revert），不适合做**数据准备**——后者应该写成普通函数，在函数体第一行调用。
+
+> **总结一句：modifier 只能"看"你传给它的东西，不能"看"被它修饰的函数。**
 
 ---
 
