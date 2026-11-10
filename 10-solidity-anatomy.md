@@ -59,6 +59,7 @@
 | 23 | 想判断两个地址不相等该怎么写？为什么那条 `!=` 断言永远不会失败 | §11.5·提问 23 |
 | 24 | 事件测试怎么写？`vm.expectEmit` 那四个 `bool` 各检查什么 | §11.5·提问 24 |
 | 25 | `modifier` 的参数有什么限制？它和被修饰的函数是什么关系 | §7.9 末尾·提问 25 |
+| 26 | modifier 要 2 个参数、函数只有 0 或 1 个参数会编译失败吗？顺序反了呢 | §7.9 末尾·提问 26 |
 
 ---
 
@@ -1808,6 +1809,96 @@ function earlyReturn() external guard returns (uint256) { return 7; }
 **③ modifier 无法把东西"返回"给函数体**：不能 return 值、局部变量不可见。唯一通道是写 storage。所以 modifier 只适合做**守卫**（检查 + revert），不适合做**数据准备**——后者应该写成普通函数，在函数体第一行调用。
 
 > **总结一句：modifier 只能"看"你传给它的东西，不能"看"被它修饰的函数。**
+
+#### ❓ 提问 26：modifier 有 2 个参数，但函数只有 1 个（或 0 个）参数，会编译失败吗？顺序反了呢？
+
+**都不会。因为两者之间根本没有"对应关系"。**
+
+人们在这一点上常带着 Java/TypeScript 注解的直觉：以为参数要"签名匹配"。实际上只有一条规则：
+
+> **modifier 的形参个数，只由 modifier 自己的定义决定。**
+> **函数负责提供实参，个数必须和形参一致——但和函数自己的参数个数毫无关系。**
+
+实参可以是**任何表达式**：函数参数、状态变量、常量、`msg.sender`、函数调用结果，全都可以。
+
+### 一、八种情况逐个编译（solc 0.8.24）
+
+| # | 场景 | 结果 |
+| --- | --- | --- |
+| 1 | 函数 **0 个**参数，modifier **2 个**参数（实参用状态变量） | ✅ 通过 |
+| 2 | 函数 1 个参数，modifier 2 个参数（实参 = 函数参数 + 状态变量） | ✅ 通过 |
+| 3 | 函数参数顺序与 modifier 形参顺序**相反** | ✅ 通过 |
+| 4 | 实参比形参**少** | ❌ **Error 2973**: Wrong argument count for modifier invocation: 1 arguments given but expected 2 |
+| 5 | 实参比形参**多** | ❌ **Error 2973**: 3 arguments given but expected 2 |
+| 6 | 类型不匹配 | ❌ **Error 4649**: Invalid type for argument in modifier invocation. Invalid implicit conversion from address to uint256 requested |
+| 7 | 两个**同类型**参数传反了 | ⚠️ **编译通过**（最危险，见下） |
+| 8 | 实参是函数调用 `m(derive(sup), sup)` | ✅ 通过 |
+
+### 二、函数 0 参 + modifier 2 参，长什么样
+
+```solidity
+uint256 public nextId = 1;
+address public supplier = address(0xBEEF);
+
+modifier m(uint256 noteId, address sup) {
+    require(noteId > 0 && sup != address(0));
+    _;
+}
+
+// 函数一个参数都没有，实参从状态变量来
+function f() external m(nextId, supplier) { }
+```
+
+**完全合法。** 只要签名那个位置能算出一个 `uint256` 和一个 `address` 就行。
+
+### 三、顺序不一致也合法——因为编译器只看位置，不看名字
+
+```solidity
+modifier m(uint256 noteId, address sup) { ... }
+
+// 函数自己的顺序是 (address, uint256)，与 modifier 的 (uint256, address) 相反
+function f(address sup, uint256 id) external m(id, sup) { }
+```
+
+✅ 通过。**顺序不需要一致，只有"实参位置"要对**：
+
+```
+m(id,  sup)
+   ↓    ↓
+m(uint256 noteId, address sup)
+        ↑ 第 1 个实参必须是 uint256
+```
+
+名字是给人看的，位置才是给编译器的。
+
+### 四、⚠️ 真正会出事的地方：同类型参数传反，编译器一个字都不会说
+
+```solidity
+modifier m(address expectedHolder, address expectedSupplier) { ... }
+
+// 本意是 m(holder, supplier)，手一抖写成 m(supplier, holder)
+function f() external m(supplier, holder) { }
+```
+
+✅ **编译通过。** 因为两个形参都是 `address`，类型检查没有任何理由报错。
+
+后果取决于 modifier 的逻辑：
+
+| modifier 里的判断 | 传反之后 |
+| --- | --- |
+| `require(msg.sender == h \|\| msg.sender == s)` | **照常工作**（对称逻辑，看不出错） |
+| `require(msg.sender == h)`（只认 holder） | **放行了供应商**，权限被绕过 |
+
+这就是"**类型相同、语义相反**"的经典陷阱。防御手段只有三条：
+
+1. **形参名写清期望**：`expectedHolder` / `expectedSupplier`，而不是 `a` / `b`
+2. **测试必须测"用错身份被拒"**，不能只测"对的身份能过"——这正是练习 01 第 5 条「旧钥匙失效」的同一条道理
+3. 如果两个参数确实同类型又容易混，考虑拆成两个 modifier，或用一个 `struct` 把语义绑在字段名上
+
+### 五、一句话记住
+
+> **顺序不一致不是问题，位置错位才是问题。**
+> **参数个数不一致一定报错（Error 2973），但"个数"说的是实参 vs 形参，与函数自己的参数无关。**
 
 ---
 
