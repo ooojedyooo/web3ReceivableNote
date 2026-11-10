@@ -127,17 +127,31 @@ contract ReceivableNote {
     );
     event NoteConfirmed(uint256 indexed id, address indexed confirmer, uint64 confirmedAt);
     event NoteTransferred(uint256 indexed id, address indexed from, address indexed to);
+    // 【2026-11-10 新增的两个时间戳】为什么要往事件里塞 block.timestamp：
+    //   算「银行实际赚了几个点」需要持有天数 = 结算时间 − 贴现时间。
+    //   这两个时间点在链上没有第三个地方能推出来：
+    //     · storage 里没有（要加就得新开 slot，一次 SSTORE 20,000 gas）
+    //     · 区块头有 timestamp，但 eth_getLogs 返回的 log 对象里**没有时间字段**
+    //       （EIP-1474 的字段只有 address/blockHash/data/transactionHash/blockNumber/
+    //         logIndex/transactionIndex/topics/removed）—— 要时间就得按 blockNumber 再查一次块，
+    //       索引 1 万条日志就是 1 万次额外 RPC。
+    //   加进事件的代价实测 313 gas（同一个 emit 分别带/不带 uint64，冷状态下对比），
+    //   相对 settle 一笔 7.7 万 gas 是 0.4%；相对 SSTORE 的 2 万 gas 是它的 1/64。
+    //   ⚠️ 但要清楚它买到了什么：只买到「链下能算」，买不到「合约里能算」——
+    //      LOG 是只写出口，合约自己永远读不回来（见第 10 讲提问 30）。
     event NoteDiscounted(
         uint256 indexed id,
         address indexed from,
         address indexed financier,
-        uint96 payAmount
+        uint96 payAmount,
+        uint64 discountedAt // 银行的持有期起点。与下面 redeemedAt 相减 = 实际持有天数
     );
     event NoteRedeemed(
         uint256 indexed id,
         address indexed issuer,
         address indexed holder,
-        uint96 amount
+        uint96 amount,
+        uint64 redeemedAt // 持有期终点。链下：bps = 息×365×10000 / (实付×持有天数)
     );
     event NoteVoided(uint256 indexed id, address indexed by);
     event FinancierSet(address indexed financier, bool allowed);
@@ -352,7 +366,7 @@ contract ReceivableNote {
         _notes[id].holder = financier;
         _notes[id].status = Status.Discounted;
 
-        emit NoteDiscounted(id, from, financier, payAmount);
+        emit NoteDiscounted(id, from, financier, payAmount, uint64(block.timestamp));
     }
 
     /// @notice 第四步：兑付。到期日，核心企业把票面金额付给当前持票人
@@ -381,7 +395,7 @@ contract ReceivableNote {
 
         // 事件放在外部调用之前：万一后续失败，整笔交易连同这条 log 一起回滚，结果等价；
         // 但放在之后会留下「重入时日志顺序错乱」的隐患（forge lint 的 reentrancy-events 就是在报这个）。
-        emit NoteRedeemed(id, msg.sender, payee, amount);
+        emit NoteRedeemed(id, msg.sender, payee, amount, uint64(block.timestamp));
 
         // --- Interactions：最后才动钱 ---
         (bool ok, ) = payee.call{value: amount}("");

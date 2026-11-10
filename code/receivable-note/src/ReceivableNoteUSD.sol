@@ -168,18 +168,34 @@ contract ReceivableNoteUSD {
     /// @dev 比 ETH 版多传 faceValue：这一版的资金流是 pull 模型，链下对账系统
     ///      需要「实付多少 + 票面多少」两个数才能核销应收与贴现息。
     ///      少一个字段，对账就得回合约再查一次（那是一笔额外的 RPC）。
+    ///
+    ///      【2026-11-10 新增 discountedAt / redeemedAt】这两个时间戳是为了算「实际年化」：
+    ///        holdingDays = redeemedAt − discountedAt
+    ///        bps_actual  = (amount − payAmount) × 365 × 10000 / (payAmount × holdingDays)
+    ///      注意它和 discountYieldBps() 不是一回事：那个函数算的是「假设今天贴现、到期准时兑付」
+    ///      的**报价快照**（分母是 dueDate − now，逐日变）；这里的 bps_actual 是**结算后锁死的事实**
+    ///      （分母是真实持有天数，不再变）。两者只在「恰好到期日结算」时才相等。
+    ///
+    ///      为什么放事件不放 storage：实测多一个 uint64 参数 +313 gas，
+    ///      而新开一个 storage slot 是 20,000 gas —— 差 64 倍。
+    ///      为什么不能只靠区块时间戳：eth_getLogs 返回的 log 对象没有时间字段（EIP-1474），
+    ///      链下要时间就得按 blockNumber 再查一次块，等于每条日志多一次 RPC。
+    ///      ⚠️ 代价要认：LOG 是只写出口，合约内部永远读不到这两个值 ——
+    ///      想让 discountYieldBps() 自己返回实际值，只能写进 storage（见第 10 讲提问 30）。
     event NoteDiscounted(
         uint256 indexed id,
         address indexed holder,
         address indexed financier,
         uint96 payAmount,
-        uint96 faceValue
+        uint96 faceValue,
+        uint64 discountedAt // 银行持有期起点
     );
     event NoteRedeemed(
         uint256 indexed id,
         address indexed issuer,
         address indexed holder,
-        uint96 amount
+        uint96 amount,
+        uint64 redeemedAt // 持有期终点
     );
     event NoteVoided(uint256 indexed id, address indexed by);
     event FinancierSet(address indexed financier, bool allowed);
@@ -415,7 +431,7 @@ contract ReceivableNoteUSD {
         n.status = Status.Discounted;
         n.discountPrice = payAmount;
 
-        emit NoteDiscounted(id, holder, financier, payAmount, faceValue);
+        emit NoteDiscounted(id, holder, financier, payAmount, faceValue, uint64(block.timestamp));
 
         // --- Interactions：最后才动钱 ---
         // 注意这里的参数顺序：(from=financier, to=holder)。
@@ -462,7 +478,7 @@ contract ReceivableNoteUSD {
         n.status = Status.Redeemed;
         totalSettled += amount;
 
-        emit NoteRedeemed(id, msg.sender, holder, amount);
+        emit NoteRedeemed(id, msg.sender, holder, amount, uint64(block.timestamp));
 
         // --- Interactions ---
         _pullExact(coreEnterprise, holder, amount);
@@ -583,22 +599,31 @@ contract ReceivableNoteUSD {
     ///      把 0.0827 这种小数放大成整数 827 —— 链上没有浮点，百分比只能这么存。
     function discountYieldBps(uint256 id) external view returns (uint256 interest, uint256 bps) {
         Note storage n = _notes[id];
-        // ⚠️ TODO（已知缺陷，未修 —— 见第 10 讲提问 29）：
-        //    这一行让「兑付之后」查不到任何历史：status 变成 Redeemed 后直接返回 (0,0)，
-        //    但 amount / discountPrice 是永久字段，贴现息随时算得出来。
-        //    实测：兑付后 interest 返回 0，而 storage 里 100 万 / 98 万原封不动。
-        //    正确判据应是「贴过现吗」而不是「还在贴现在途吗」→ 改成 n.discountPrice == 0。
-        //    ⚠️ 但只改这一行会立刻炸：下面 `n.dueDate - block.timestamp` 在兑付后
-        //    （now >= dueDate）会下溢，Panic(0x11) 回滚。现在没炸是因为这行提前 return
-        //    当了个意外的挡箭牌。修复必须成对：daysLeft 也要加三元保护。
-        if (n.status != Status.Discounted) return (0, 0);
+
+        // 【判据修正，2026-11-10】旧代码是 `if (n.status != Status.Discounted) return (0,0);`
+        // 它问的是「现在还在贴现中吗」，而不是「贴过现吗」——
+        // 实测：兑付后 status 变 Redeemed，interest 直接返回 0，
+        // 而 storage 里 100 万 / 98 万原封不动。正确判据是 discountPrice == 0
+        //（0 = 从没贴现过，discount() 里的 ZeroAmount 检查保证了这个前提）。
+        if (n.discountPrice == 0) return (0, 0);
         interest = n.amount - n.discountPrice;
+
+        // 【下溢保护，与上面那行是一对，不能只改一处】旧代码能跑纯属巧合：
+        // 靠上面那行提前 return 挡住了 now >= dueDate 时的减法下溢（Panic 0x11）。
+        // 判据一改，挡箭牌就没了，必须显式写出来。
+        // 不能改成 `if (now >= dueDate) revert`：历史查询是正常业务，不该报错。
         // forge-lint: disable-next-line(block-timestamp,divide-before-multiply)
         // 先除是有意的：要的是「整天数」，不是精确到秒的剩余时间。
         // 财务按天计息，这里多保留的小数位反而是噪声。
-        uint256 daysLeft = (n.dueDate - block.timestamp) / 1 days;
+        uint256 daysLeft = block.timestamp < n.dueDate
+            ? (n.dueDate - block.timestamp) / 1 days
+            : 0;
+
+        // bps 的分母是「剩余天数」，所以它只在票据还没到期时有意义。
+        // 到期后（daysLeft == 0）返回 bps = 0，但 interest 照常返回 ——
+        // 这两个数生命周期不同：「息是多少」是永久事实，「年化多少」是当时的市场报价。
         // forge-lint: disable-next-line(block-timestamp)
-        if (daysLeft == 0 || n.discountPrice == 0) return (interest, 0);
+        if (daysLeft == 0) return (interest, 0);
         // ↓ 括号不是排版偏好，是「能不能算出正确结果」：
         //   若按公式字面从左到右写成 interest / discountPrice * 365 / daysLeft * 10000，
         //   第一刀 20000/980000 就被整数除法截成 0，后面乘什么都还是 0（实测三种写法：

@@ -242,4 +242,45 @@ contract ReceivableNoteUSDTest is Test {
         // 若状态在转账之后才落，重入时第二次 redeem 会通过 status 检查，付两次钱。
         assertEq(uint8(note.getNote(id).status), uint8(ReceivableNoteUSD.Status.Redeemed));
     }
+
+    /* ==================== 8. 贴现息的历史可查性（discountYieldBps 修复） ==================== */
+
+    /// @notice 回归：兑付之后，这张票的贴现息必须还能查到。
+    ///         修复前判据写的是 status != Discounted，一兑付就返回 (0,0)，
+    ///         财务报表里 2 万的贴现收益凭空消失。
+    ///         锁两件事：interest 活下来（永久事实），bps 归零（分母没了）。
+    function test_YieldBps_StillQueryableAfterRedeem() public {
+        uint256 id = _issue(uint96(FACE));
+        _approve(bank, PAY);
+        vm.prank(supplierA);
+        note.discount(id, bank, uint96(PAY));
+
+        vm.warp(due + 1);
+        _approve(core, FACE);
+        vm.prank(core);
+        note.redeem(id);
+
+        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        console.log(unicode"兑付后贴现息    :", interest / UNIT);
+        console.log(unicode"兑付后年化(bps) :", bps);
+
+        assertEq(interest, FACE - PAY, "after redeem: interest is permanent");
+        assertEq(bps, 0, "after redeem: bps has no denominator");
+    }
+
+    /// @notice 回归：逾期未兑付 —— 旧代码在这里会 Panic(0x11)。
+    ///         因为逾期的票状态仍是 Discounted，能过旧判据，
+    ///         接着 `dueDate - block.timestamp` 就下溢了。
+    function test_YieldBps_OverdueDoesNotPanic() public {
+        uint256 id = _issue(uint96(FACE));
+        _approve(bank, PAY);
+        vm.prank(supplierA);
+        note.discount(id, bank, uint96(PAY));
+
+        vm.warp(due + 100 days);
+
+        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        assertEq(interest, FACE - PAY, "overdue: interest still there");
+        assertEq(bps, 0, "overdue: bps = 0, no panic");
+    }
 }

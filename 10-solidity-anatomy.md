@@ -63,6 +63,7 @@
 | 27 | `_notes[id].x = v` 和 `Note storage n = _notes[id]; n.x = v` 有本质区别吗 | §9.5 末尾·提问 27 |
 | 28 | `discountYieldBps` 的年化公式，为什么括号是这么打的？`interest` 到底是给谁的钱 | §9.10 末尾·提问 28 |
 | 29 | 实际付款日要不要记？`dueDate - realPaymentDay` 能还原当时的年化吗 | §9.10 末尾·提问 29 |
+| 30 | 事件里加个时间戳，能不花成本拿到"实际 bps"吗？为什么合约自己读不到事件 | §9.10 末尾·提问 30 |
 
 ---
 
@@ -3184,6 +3185,115 @@ uint256 daysLeft = block.timestamp < n.dueDate
 3. **🟢 看需求**：明确要做链上定价（比如票据 NFT 按实际年化挂单）时，才加那两个 `uint64`，并且打包进一个槽。
 
 **一句话**：`dueDate - paidAt` 记的是"提前了几天"，不是"持有几天"；而比记时间更急的，是先让 `discountYieldBps` 在票据结清后还能回答"这笔赚了多少"。
+
+---
+
+#### ❓ 提问 30：在 `NoteSettled` 事件里加个时间，能不花成本拿到"实际 bps"吗？
+
+**先回答"能不能"：能，而且已经做了。** 但它买到的和很多人以为的不一样，这一节把账算清楚。
+
+##### 一、先把"三个 bps"分清，不然永远对不上账
+
+以票面 100 万、实付 97 万为例，同一笔业务有**三个都叫"年化"**的数：
+
+| 口径 | 分母（天数） | 什么时候定死 | 数值 | 谁在看 |
+|---|---|---|---|---|
+| **报价年化** `discountYieldBps()` | `dueDate − now` | 逐日变 | 贴现当天 1254，一个月后 2508 | 业务员报价、台账快照 |
+| **合同年化** | `dueDate − discountedAt` | 贴现当天定死 | 恒为 1254 | 合同、审计底稿 |
+| **实际年化** | `settledAt − discountedAt` | 结算后定死 | 晚 10 天结算 → **1128** | 资金方考核、业绩归因 |
+
+`discountYieldBps()` 算的是第一列。它不是错的，它回答的是"**如果今天贴现、到期准时兑付，年化是多少**"——一个报价问题。但它**永远不等于实际收益**，因为真实结算日几乎不会正好等于到期日。
+
+> 实测（`test_ActualBpsFromEvents`）：90 天期、晚 10 天结算，持有 100 天。
+> 实际 1128 bps vs 合同 1254 bps —— **拖 10 天，年化掉 126 个基点**。这就是银行催收的真实动力。
+
+##### 二、"实际 bps"缺的到底是什么
+
+公式本身不用改，缺的是两个时间点：
+
+```
+bps_actual = (amount − discountPrice) × 365 × 10000 / (discountPrice × holdingDays)
+                                                              ↑
+                                              holdingDays = settledAt − discountedAt
+```
+
+- `amount`、`discountPrice` → 已经在 storage 里，**永久可读**（这也是提问 29 修 bug 的前提）
+- `discountedAt` → `NoteDiscounted` 事件
+- `settledAt` → `NoteSettled` 事件
+
+**所以真正要解决的只有一件事：这两个时间点放哪。**
+
+##### 三、三条路的实测成本
+
+| 方案 | 增量成本 | 链上能读吗 | 链下好取吗 |
+|---|---|---|---|
+| A. 什么都不加，靠区块头 `timestamp` | **0 gas** | ❌ | ⚠️ 要 N+1 次 RPC |
+| B. 加进事件参数 | **+313 gas** | ❌ | ✅ 日志自带 |
+| C. 写进 storage（新开 slot） | **+20,000 gas** | ✅ | ✅ |
+| D. 事件里位打包（`amount \| time << 96`） | **≈ 0 gas** | ❌ | ⚠️ 要手动拆包 |
+
+**B 的 313 怎么来的**（`forge test` 实测，两次测量必须分在两个 test 里跑，否则第二次命中 warm access 少 2600 gas，测出来是假数）：
+
+```
+[no time  ] gas: 29428      ← emit(id, a, b, uint96, bytes32)         data 64 字节
+[with time] gas: 29741      ← 多一个 uint64                            data 96 字节
+[packed   ] gas: 29406      ← 位打包，data 仍是 64 字节
+                           差 313 gas；打包版比不加还便宜 22（噪声内）
+```
+
+313 ÷ settle 一笔 7.7 万 gas = **0.4%**；313 ÷ 20,000（一个 slot 的冷写）= **1/64**。这就是"日志便宜、存储贵"的量化版本 —— **同一个 `uint64`，放事件比放 storage 便宜 64 倍。**
+
+> **真实业务上下文里复核过**：`GasCompare.t.sol` 的 gas 快照（这一版代码改前 vs 改后）
+> `eth.redeem` 73,827 → **74,130（+303）**、`usd.redeem` 77,635 → **77,923（+288）**。
+> 和隔离探针的 313 差十几 gas，因为真实函数里多了一次内存写入复用。
+> 顺带：`eth.issue` 也从 145,639 涨到 145,699 —— 那是**部署字节码大了 19 字节**的分摊，不是 issue 本身变贵。
+
+##### 四、A 方案那个"0 gas"有个坑
+
+区块头里本来就有 `timestamp`，看起来白拿。但 **`eth_getLogs` 返回的 log 对象里没有时间字段**。EIP-1474 定义的字段只有九个：
+
+```
+address / blockHash / data / transactionHash / blockNumber
+logIndex / transactionIndex / topics / removed
+```
+
+要时间，只能拿 `blockNumber` 再发一次 `eth_getBlockByNumber`。索引 1 万条日志 = 1 万次额外请求。**这不是 gas 成本，是工程成本** —— 而且它会被每个查询方重复支付一遍。索引器（The Graph / Ponder / 自建）通常在入库时就存 `block_timestamp`，如果你已经有索引器，A 方案的坑等于不存在。
+
+##### 五、⚠️ 最容易被误解的一点：事件合约读不到
+
+加完事件字段，`discountYieldBps()` 依然**不可能**返回实际 bps。原因是 EVM 的硬约束：
+
+> **LOG 是只写出口。** `emit` 把数据写进交易的收据（receipt），交易结束后由节点存进日志库；合约自己的代码里**没有任何操作码能读回来**。这不是 Solidity 的限制，是 EVM 的设计——日志从来不进状态树，所以它便宜。
+
+推论很干脆：
+
+- 想让**链下**算 → 事件足够，+313 gas
+- 想让**合约里**算（比如票据 NFT 按实际年化挂单定价）→ 必须 storage，+20,000 gas 起，而且要加两个 `uint64`（打包进同一个新槽）
+
+本项目的判断：**没有第二个链上合约会读这个值，所以选事件，不选 storage。**
+
+##### 六、落地结果（三版已同步）
+
+```solidity
+event NoteDiscounted(..., uint96 payAmount, uint64 discountedAt);
+event NoteRedeemed  (..., uint96 amount,    uint64 redeemedAt);
+event NoteSettled   (..., uint96 amount, bytes32 settlementRef, uint64 settledAt);
+```
+
+链下拿到两条日志后，这段就是全部工作量：
+
+```solidity
+uint256 holdingDays = (settledAt - discountedAt) / 1 days;
+uint256 bps = (interest * 365 * 10_000) / (discountPrice * holdingDays);
+```
+
+没有循环、没有链上调用、没有第三方 —— 两条日志，一次减法。
+
+> **顺便说说 D（位打包）为什么不用。** 把 `settledAt` 塞进 `uint96 amount` 高位的 20 个空字节里，`data` 长度不变，实测 gas 增量确实 ≈ 0。但代价是 ABI 变成自定义格式：`abi.decode` 解不出来、区块浏览器显示成一串 20 位的天文数字、每个对接方都要抄一遍位运算。**省 313 gas 换永久性的可读性损失，在 RWA 这种要给审计和监管看的场景里是亏的。** 这个手法值得知道（很多 gas 优化库在用），但用在这里不合适。
+
+##### 七、一句话收口
+
+**事件加时间 = 花 313 gas，把"链下算实际 bps"这件事从"要查区块"变成"读日志就行"；它换不来"链上算实际 bps"，那件事的价格是 20,000 gas 起。**
 
 ---
 

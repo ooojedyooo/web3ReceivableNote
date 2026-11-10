@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test, console} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {ReceivableNoteRegistry} from "../src/ReceivableNoteRegistry.sol";
 
 /// @dev 存证版的测试。重点不在「钱怎么转」（这里没有钱），而在两件事：
@@ -291,6 +292,102 @@ contract ReceivableNoteRegistryTest is Test {
             / (uint256(DISCOUNT_PRICE) * 90);
         assertEq(bps, expected, "annualized bps");
         assertGt(bps, 0, "bps must be positive");
+    }
+
+    /// @dev 回归测试①：结算之后还能不能查到贴现息。
+    ///      修复前的判据是 status != Discounted，一结算就返回 (0,0)，
+    ///      于是所有「历史业绩统计」在票据结清那一刻集体归零。
+    ///      这里同时锁死两件事：interest 必须活下来，bps 必须归零（分母没了）。
+    function test_YieldBps_StillQueryableAfterSettle() public {
+        uint256 id = _issueConfirmed();
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
+
+        // 贴现当天先取一份，作为「当时的报价」
+        (uint256 interestOnDay0,) = note.discountYieldBps(id);
+        assertEq(interestOnDay0, FACE - DISCOUNT_PRICE, "day0: interest");
+
+        vm.warp(dueDate);
+        vm.prank(core);
+        note.settle(id, BANK_REF_2);
+
+        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        assertEq(interest, FACE - DISCOUNT_PRICE, "after settle: interest is permanent");
+        assertEq(bps, 0, "after settle: bps has no denominator");
+    }
+
+    /// @dev 回归测试②：逾期未结算 —— 这是旧代码真正会 Panic 的场景。
+    ///      旧逻辑只拦「status 不是 Discounted」，而逾期的票恰好还是 Discounted，
+    ///      于是 `dueDate - block.timestamp` 直接下溢 → Panic(0x11)。
+    ///      注意这里**不结算**，就是让票据挂在逾期状态上挨查。
+    function test_YieldBps_OverdueDoesNotPanic() public {
+        uint256 id = _issueConfirmed();
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
+
+        vm.warp(dueDate + 100 days);
+
+        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        assertEq(interest, FACE - DISCOUNT_PRICE, "overdue: interest still there");
+        assertEq(bps, 0, "overdue: bps = 0, no panic");
+    }
+
+    /// @dev 回归测试③：从没贴现过 → (0,0)，不 revert。
+    ///      「没贴现」是业务上不存在，不是调用错误，所以不该抛异常。
+    function test_YieldBps_NeverDiscounted() public {
+        uint256 id = _issueConfirmed();
+
+        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        assertEq(interest, 0, "never discounted: interest = 0");
+        assertEq(bps, 0, "never discounted: bps = 0");
+    }
+
+    /// @dev 完整演示「链下怎么从两条事件算出实际年化」——这是加两个时间戳的唯一目的。
+    ///      步骤：vm.recordLogs 抓日志 → abi.decode 拆 data → 用真实持有天数算 bps。
+    ///      刻意让结算日 ≠ 到期日（晚 10 天），好让「实际 bps」和「报价 bps」拉开差距，
+    ///      证明这两个数不是一回事。
+    function test_ActualBpsFromEvents() public {
+        uint256 id = _issueConfirmed();
+
+        // ① 贴现：抓 NoteDiscounted，取持有期起点
+        vm.recordLogs();
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        // data 里是非 indexed 参数，按声明顺序：(payAmount, faceValue, discountedAt)
+        (, , uint64 discountedAt) = abi.decode(logs[0].data, (uint96, uint96, uint64));
+        assertEq(discountedAt, uint64(block.timestamp), "discountedAt = now");
+
+        // ② 逾期 10 天才结算，持有期变成 100 天
+        vm.warp(dueDate + 10 days);
+
+        vm.recordLogs();
+        vm.prank(core);
+        note.settle(id, BANK_REF_2);
+        logs = vm.getRecordedLogs();
+
+        // data 顺序：(amount, settlementRef, settledAt)
+        (uint96 amount, bytes32 ref, uint64 settledAt) =
+            abi.decode(logs[0].data, (uint96, bytes32, uint64));
+        assertEq(settledAt, uint64(block.timestamp), "settledAt = now");
+        assertEq(amount, FACE, "amount = face value");
+        assertEq(ref, BANK_REF_2, "settlementRef");
+
+        // ③ 下面这段就是「链下索引器」要做的事，一行不多
+        uint256 holdingDays = (settledAt - discountedAt) / 1 days;
+        assertEq(holdingDays, 100, "90-day term + 10-day delay");
+
+        uint256 interest = amount - DISCOUNT_PRICE;
+        uint256 bpsActual = (interest * 365 * 10_000) / (uint256(DISCOUNT_PRICE) * holdingDays);
+        uint256 bpsQuoted = (interest * 365 * 10_000) / (uint256(DISCOUNT_PRICE) * 90);
+
+        console.log(unicode"持有天数        :", holdingDays);
+        console.log(unicode"实际年化(bps)   :", bpsActual);
+        console.log(unicode"合同年化(bps)   :", bpsQuoted);
+
+        // 拖得越久，同样一笔息摊到更长的时间上，年化越低
+        assertLt(bpsActual, bpsQuoted, "late settlement lowers actual annualized yield");
     }
 
     /* ---------------- 6. 权限与边界 ---------------- */

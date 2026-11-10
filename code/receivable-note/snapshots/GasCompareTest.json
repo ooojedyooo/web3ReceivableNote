@@ -1,10 +1,10 @@
 {
-  "eth.confirm": "29788",
-  "eth.discount": "35861",
-  "eth.issue": "145639",
-  "eth.redeem": "73827",
+  "eth.confirm": "29800",
+  "eth.discount": "36158",
+  "eth.issue": "145699",
+  "eth.redeem": "74130",
   "usd.confirm": "29867",
-  "usd.discount": "86001",
+  "usd.discount": "86301",
   "usd.issue": "145704",
-  "usd.redeem": "77635"
+  "usd.redeem": "77923"
 }
