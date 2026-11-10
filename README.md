@@ -39,8 +39,10 @@
 | **12** | **（补充）event 与 error 的编码规则** | **签名怎么来、indexed 与非 indexed、error 只有 4 字节** | **已完成** |
 | **13** | **（补充）一条日志的物理结构** | **topics / data / topic0 到底是什么、LOG 指令、bloom 过滤、logIndex** | **已完成** |
 | 14 | 预言机与价格来源 | 价格从哪来、操纵与清算 | 未开始 |
+| **15** | **（补充·业务篇）从 demo 到真实业务：三堵墙** | **gas 谁付、钱走线上还是线下、境内能不能做（2026.2 八部门新规）** | **已完成** |
 
 > 10 / 11 / 12 / 13 是应「要完全读懂合约」的要求插入的**补充讲**，不占原 20 周计划的主线进度。原定第 10 讲（预言机）顺延为第 14 讲。
+> 15 是**业务篇**，不属于技术主线：它回答「这套代码在哪个市场能用、为什么」，原第 14 讲（预言机）仍待补。
 
 ### 动手练习（模块二收尾，从"读懂"跨到"能改"）
 
@@ -58,11 +60,15 @@
 - `ReceivableNote.sol`：ETH 结算版，开立 → 确权 → 转让 → 贴现 → 兑付，5 状态机
 - `ReceivableNoteUSD.sol`：**稳定币结算版**，ERC-20 pull 模型（approve → transferFrom）、
   非标准代币兼容（不返 bool / fee-on-transfer）、黑名单场景、`totalSettled` 对账汇总
+- `ReceivableNoteRegistry.sol`：**存证版（境内合规形态）**，合约里没有任何一笔钱 ——
+  只做状态机 + 结算回执（`settlementRef`）+ 冻结/解冻（与状态正交的独立维度）。
+  对应 2026 年 2 月八部门新规下「去代币化」的现实路径，详见第 15 讲
 - `MockUSDC.sol`：6 位小数 + 黑名单 + 可增发，模拟真实 USDC 的三个权力
-- **52 个测试全通过**（含 2 个 fuzz、CEI 探针、黑名单失败、锁死演示、gas 对照）
+- **74 个测试全通过**（ETH 38 + USDC 12 + 存证 22 + gas 对照 2，含 2 个 fuzz、CEI 探针、黑名单失败、锁死演示）
 - 练习 01 已落地：`admin` 从 `immutable` 改为 storage + `pendingAdmin`，
   新增 `transferAdmin` / `acceptAdmin` 两步转移，事件 `ChangeAdmin` / `ConfirmedNewAdmin` 已有测试覆盖
 - 实测单张凭证全生命周期：ETH 版 285,119 gas / USDC 版 339,207 gas（同口径）
+- 合约体积：ETH 5,613 B / USDC 6,823 B / 存证 7,186 B（上限 24,576 B）
 - `demo-local.sh`（ETH 版）、`demo-usdc.sh`（USDC 版）：anvil 真实链上跑通全流程
 
 **`code/syntax-lab/`** —— 关键字实测台，所有结论在 solc 0.8.24 上逐条编译验证。

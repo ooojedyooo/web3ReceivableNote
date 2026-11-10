@@ -134,7 +134,57 @@ Interactions  →  最后才 call{value:} 转钱
 
 ---
 
-## 六、跑起来
+## 六、存证版：境内合规形态（第 15 讲）
+
+`ReceivableNoteRegistry.sol`。状态机与前两版完全一致，**区别只有一句：合约里没有任何一笔钱。**
+
+### 为什么要有第三版
+
+2026 年 2 月 6 日，央行等八部门《关于进一步防范和处置虚拟货币等相关风险的通知》明确：境内开展现实世界资产（RWA）代币化活动，以及提供有关中介、信息技术服务等，**应予禁止**；只有「经业务主管部门依法依规同意，依托特定金融基础设施开展」的除外。
+
+所以境内能做的不是「公链 + 代币」，而是「联盟链 + 存证」。完整的政策口径见 `../15-business-reality.md`。
+
+### 三版的差别
+
+| | ETH 版 | USD 版 | 存证版 |
+|---|---|---|---|
+| 结算 | 合约内转 ETH | approve + transferFrom | **无，只登记回执** |
+| 合约里有钱吗 | 有 | 没有（钱在用户账户） | **完全没有** |
+| 核心风险 | 重入 | 代币不标准 / fee-on-transfer | 「线下真付了吗」验证不了 |
+| 对应市场 | 教学 | 香港、离岸 | **境内** |
+
+### 去掉资金流之后，多出来的三样东西
+
+**① 结算回执 `settlementRef`**
+
+线下付完款，把银行流水号的 `keccak256` 登记上链。存哈希不存原文 —— 流水号是银行内部标识，明文上链等于把企业账户结构暴露给所有节点。
+
+**② 冻结 `frozen`（与状态正交）**
+
+```solidity
+function freeze(uint256 id, bytes32 reasonCode) external  // 仅 admin
+function unfreeze(uint256 id) external
+```
+
+关键设计：冻结是**独立字段**，不是 enum 里再塞两个状态。因为一张 `Confirmed` 的票可以被冻结，解冻后仍然是 `Confirmed` —— 塞进 enum 会变成 6×2 种组合，状态机当场失控。
+
+测试 `test_Freeze_BlocksAllMutations` 逐个验证了冻结能拦住 transferNote / discount / settle / confirm / void **全部五个**变更入口。少拦一个，冻结就形同虚设。
+
+**③ 累计结算额 `totalSettled`**
+
+财务对账要的是总数。没有它，链下得把 `1..nextNoteId` 全拉一遍自己求和，凭证上万条之后不可行。
+
+### 最脆弱的地方，必须写在文档里
+
+`settle()` **无法验证钱真的付了**，它只能记录核心企业的单方声明。
+
+真实项目靠三层补这个缺口：银行侧联动（由银行提交回执而不是企业）、银企直连（自动回传流水号）、事后审计（拿哈希去核验原文）。
+
+**这是「区块链不能自己解决信任问题」最直接的例子** —— 链只能保证记录不可篡改，不能保证记录的内容是真的。
+
+---
+
+## 七、跑起来
 
 ### 前提
 
@@ -157,7 +207,7 @@ forge install foundry-rs/forge-std
 ### 单元测试
 
 ```bash
-forge test                                         # 跑全部 52 个测试（ETH 版 38 + USDC 版 12 + gas 对照 2）
+forge test                                         # 跑全部 74 个测试（ETH 版 38 + USDC 版 12 + 存证版 22 + gas 对照 2）
 forge test -vv                                     # 看事件和 console 输出
 forge test --gas-report                            # 看每个函数的 gas
 forge test --match-test test_FullLifecycle -vv     # 只看完整业务链
@@ -193,7 +243,7 @@ cast send <合约地址> "issue(address,uint96,uint64,bytes32)" \
 
 ---
 
-## 七、实测数据（solc 0.8.24，optimizer 200）
+## 八、实测数据（solc 0.8.24，optimizer 200）
 
 | 操作 | Gas | 20 gwei / ETH $3000 时成本 |
 |---|---|---|
@@ -222,7 +272,7 @@ cast send <合约地址> "issue(address,uint96,uint64,bytes32)" \
 
 ---
 
-## 八、这个版本的边界（诚实清单）
+## 九、这个版本的边界（诚实清单）
 
 写完一个合约，最该说清的是「它不做什么」。
 
@@ -239,7 +289,7 @@ cast send <合约地址> "issue(address,uint96,uint64,bytes32)" \
 
 ---
 
-## 九、下一步可以自己动手改的三处
+## 十、下一步可以自己动手改的三处
 
 按难度排序，做完这三个，这个项目就能拿出去讲了：
 
@@ -249,18 +299,20 @@ cast send <合约地址> "issue(address,uint96,uint64,bytes32)" \
 
 ---
 
-## 十、目录
+## 十一、目录
 
 ```
 receivable-note/
 ├── src/
-│   ├── ReceivableNote.sol       ETH 结算版（约 290 行，全中文注释）
-│   ├── ReceivableNoteUSD.sol    稳定币结算版（ERC-20 pull 模型）
+│   ├── ReceivableNote.sol       ETH 结算版（约 420 行，全中文注释）
+│   ├── ReceivableNoteUSD.sol    稳定币结算版（ERC-20 pull 模型，约 590 行注释版）
+│   ├── ReceivableNoteRegistry.sol 存证版（境内合规，无任何资金流，约 585 行注释版）
 │   ├── interfaces/IERC20.sol    ERC-20 最小接口 + 三个必读的可选方法
 │   └── mocks/MockUSDC.sol       6 位小数 + 黑名单 + 可增发
 ├── test/
-│   ├── ReceivableNote.t.sol     33 个测试（业务状态机）
+│   ├── ReceivableNote.t.sol     38 个测试（业务状态机 + 管理员两步转移 + 事件）
 │   ├── ReceivableNoteUSD.t.sol  12 个测试（approve 方向 / decimals / 黑名单 / 锁死）
+│   ├── ReceivableNoteRegistry.t.sol 22 个测试（冻结拦截 / 结算回执 / 一票多融）
 │   └── GasCompare.t.sol         两种结算资产的 gas 同口径对照（2 个测试）
 ├── script/
 │   ├── Deploy.s.sol             ETH 版部署
