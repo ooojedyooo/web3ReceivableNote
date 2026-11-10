@@ -570,6 +570,12 @@ contract ReceivableNoteRegistry {
     ///      算收益率的分母永远是「我掏出去的本金」，也就是 discountPrice。
     function discountYieldBps(uint256 id) external view returns (uint256 interest, uint256 bps) {
         Note storage n = _notes[id];
+        // ⚠️ TODO（已知缺陷，未修 —— 见第 10 讲提问 29）：
+        //    status 变成 Redeemed 后本函数直接返回 (0,0)，此后任何「历史业绩统计」
+        //    都拿不到数。但 amount / discountPrice 是永久字段，贴现息随时算得出来。
+        //    判据应改成 n.discountPrice == 0（「贴过现吗」而非「还在贴现在途吗」）。
+        //    ⚠️ 只改这一行会炸：下面 `n.dueDate - block.timestamp` 在 now >= dueDate 时下溢，
+        //    Panic(0x11)。现在没炸全靠这行提前 return。修复必须成对加三元保护。
         if (n.status != Status.Discounted) return (0, 0);
         interest = n.amount - n.discountPrice;
         // forge-lint: disable-next-line(block-timestamp,divide-before-multiply)

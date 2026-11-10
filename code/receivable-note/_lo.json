@@ -1,0 +1,173 @@
+{
+  "storage": [
+    {
+      "astId": 46,
+      "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+      "label": "isFinancier",
+      "offset": 0,
+      "slot": "0",
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "astId": 50,
+      "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+      "label": "nextNoteId",
+      "offset": 0,
+      "slot": "1",
+      "type": "t_uint256"
+    },
+    {
+      "astId": 56,
+      "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+      "label": "_notes",
+      "offset": 0,
+      "slot": "2",
+      "type": "t_mapping(t_uint256,t_struct(Note)31_storage)"
+    },
+    {
+      "astId": 61,
+      "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+      "label": "invoiceToNote",
+      "offset": 0,
+      "slot": "3",
+      "type": "t_mapping(t_bytes32,t_uint256)"
+    },
+    {
+      "astId": 64,
+      "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+      "label": "totalSettled",
+      "offset": 0,
+      "slot": "4",
+      "type": "t_uint256"
+    }
+  ],
+  "types": {
+    "t_address": {
+      "encoding": "inplace",
+      "label": "address",
+      "numberOfBytes": "20"
+    },
+    "t_bool": {
+      "encoding": "inplace",
+      "label": "bool",
+      "numberOfBytes": "1"
+    },
+    "t_bytes32": {
+      "encoding": "inplace",
+      "label": "bytes32",
+      "numberOfBytes": "32"
+    },
+    "t_enum(Status)12": {
+      "encoding": "inplace",
+      "label": "enum ReceivableNoteUSD.Status",
+      "numberOfBytes": "1"
+    },
+    "t_mapping(t_address,t_bool)": {
+      "encoding": "mapping",
+      "key": "t_address",
+      "label": "mapping(address => bool)",
+      "numberOfBytes": "32",
+      "value": "t_bool"
+    },
+    "t_mapping(t_bytes32,t_uint256)": {
+      "encoding": "mapping",
+      "key": "t_bytes32",
+      "label": "mapping(bytes32 => uint256)",
+      "numberOfBytes": "32",
+      "value": "t_uint256"
+    },
+    "t_mapping(t_uint256,t_struct(Note)31_storage)": {
+      "encoding": "mapping",
+      "key": "t_uint256",
+      "label": "mapping(uint256 => struct ReceivableNoteUSD.Note)",
+      "numberOfBytes": "32",
+      "value": "t_struct(Note)31_storage"
+    },
+    "t_struct(Note)31_storage": {
+      "encoding": "inplace",
+      "label": "struct ReceivableNoteUSD.Note",
+      "numberOfBytes": "128",
+      "members": [
+        {
+          "astId": 15,
+          "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+          "label": "issuer",
+          "offset": 0,
+          "slot": "0",
+          "type": "t_address"
+        },
+        {
+          "astId": 17,
+          "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+          "label": "amount",
+          "offset": 20,
+          "slot": "0",
+          "type": "t_uint96"
+        },
+        {
+          "astId": 19,
+          "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+          "label": "holder",
+          "offset": 0,
+          "slot": "1",
+          "type": "t_address"
+        },
+        {
+          "astId": 21,
+          "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+          "label": "dueDate",
+          "offset": 20,
+          "slot": "1",
+          "type": "t_uint64"
+        },
+        {
+          "astId": 24,
+          "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+          "label": "status",
+          "offset": 28,
+          "slot": "1",
+          "type": "t_enum(Status)12"
+        },
+        {
+          "astId": 26,
+          "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+          "label": "discountPrice",
+          "offset": 0,
+          "slot": "2",
+          "type": "t_uint96"
+        },
+        {
+          "astId": 28,
+          "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+          "label": "supplier",
+          "offset": 12,
+          "slot": "2",
+          "type": "t_address"
+        },
+        {
+          "astId": 30,
+          "contract": "src/ReceivableNoteUSD.sol:ReceivableNoteUSD",
+          "label": "invoiceHash",
+          "offset": 0,
+          "slot": "3",
+          "type": "t_bytes32"
+        }
+      ]
+    },
+    "t_uint256": {
+      "encoding": "inplace",
+      "label": "uint256",
+      "numberOfBytes": "32"
+    },
+    "t_uint64": {
+      "encoding": "inplace",
+      "label": "uint64",
+      "numberOfBytes": "8"
+    },
+    "t_uint96": {
+      "encoding": "inplace",
+      "label": "uint96",
+      "numberOfBytes": "12"
+    }
+  }
+}
