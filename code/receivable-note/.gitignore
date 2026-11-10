@@ -15,3 +15,9 @@ lib/
 .idea/
 *.swp
 .DS_Store
+
+# 临时探针 / 一次性脚本产物（约定：以 _ 开头的都是用完就删的）
+# 例外：snapshots/ 下的 gas 快照要进仓库
+_*.sol
+_*.json
+_probe*.t.sol
