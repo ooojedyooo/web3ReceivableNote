@@ -89,8 +89,8 @@ step "⑦ 供应商贴现，银行付 98 万给供应商，换取到期收 100 �
 A_BEFORE=$(bal "$USDC" "$A")
 cast send "$NOTE" "discount(uint256,address,uint96)" 1 "$BANK" "$PAY" --private-key $A_PK --rpc-url "$RPC" >/dev/null
 A_AFTER=$(bal "$USDC" "$A")
-ST=$(cast call "$NOTE" 'getNote(uint256)((address,uint96,address,uint64,uint8,uint96,address,bytes32))' 1 --rpc-url "$RPC" | awk -F', ' '{print $5}')
-YB=$(cast call "$NOTE" 'discountYieldBps(uint256)(uint256,uint256)' 1 --rpc-url "$RPC")
+ST=$(cast call "$NOTE" 'getNote(uint256)((address,uint96,address,uint64,uint8,uint16,uint96,address,bytes32))' 1 --rpc-url "$RPC" | awk -F', ' '{print $5}')
+YB=$(cast call "$NOTE" 'discountYieldBps(uint256)(uint256,uint256,bool)' 1 --rpc-url "$RPC")
 Y_INT=$(echo "$YB" | sed -n 1p | awk '{print $1}')
 Y_BPS=$(echo "$YB" | sed -n 2p | awk '{print $1}')
 echo "  供应商收到       : $(fmt $((A_AFTER - A_BEFORE))) USDC"

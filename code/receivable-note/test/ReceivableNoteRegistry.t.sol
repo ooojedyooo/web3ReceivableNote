@@ -225,11 +225,69 @@ contract ReceivableNoteRegistryTest is Test {
         note.settle(id, bytes32(0));
     }
 
-    function test_Settle_RevertsBeforeDueDate() public {
+    /// @dev 【2026-11-11 语义反转】原来叫 test_Settle_RevertsBeforeDueDate，断言 expectRevert(NotDue)。
+    ///      NotDue 拦的是「还没到期」，**并不拦逾期** —— 方向读反了。
+    ///      存证版尤其该允许提前结算：链上要记的是「钱真的到账的时刻」，
+    ///      而不是「核心企业想起来上链的时刻」。等到 dueDate 才写，存证价值就打了折。
+    function test_Settle_BeforeDueDate_Succeeds() public {
         uint256 id = _issueConfirmed();
 
         vm.prank(core);
-        vm.expectRevert(abi.encodeWithSelector(ReceivableNoteRegistry.NotDue.selector, dueDate));
+        note.settle(id, BANK_REF_2);
+
+        assertEq(_status(id), uint8(ReceivableNoteRegistry.Status.Redeemed), "settled early");
+        assertEq(note.settlementOf(id), BANK_REF_2, "ref recorded");
+    }
+
+    /// @dev isOverDue 的一边：到期前结算 → false
+    function test_Event_Settled_EarlyNotOverdue() public {
+        uint256 id = _issueConfirmed();
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNoteRegistry.NoteSettled(
+            id, core, supplierA, FACE, BANK_REF_2, uint64(block.timestamp), false
+        );
+        vm.prank(core);
+        note.settle(id, BANK_REF_2);
+    }
+
+    /// @dev isOverDue 的另一边：逾期 30 天结算 → true
+    function test_Event_Settled_Overdue() public {
+        uint256 id = _issueConfirmed();
+        vm.warp(dueDate + 30 days);
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNoteRegistry.NoteSettled(
+            id, core, supplierA, FACE, BANK_REF_2, uint64(block.timestamp), true
+        );
+        vm.prank(core);
+        note.settle(id, BANK_REF_2);
+    }
+
+    /// @dev 边界：正好到期日当天结算 → false。这是「严格大于」的分水岭。
+    function test_Event_Settled_OnDueDateIsNotOverdue() public {
+        uint256 id = _issueConfirmed();
+        vm.warp(dueDate);
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNoteRegistry.NoteSettled(
+            id, core, supplierA, FACE, BANK_REF_2, uint64(block.timestamp), false
+        );
+        vm.prank(core);
+        note.settle(id, BANK_REF_2);
+    }
+
+    /// @dev 边界：逾期 1 秒就算逾期（true）。和上一条一起把边界夹死在 dueDate 这一点上：
+    ///      == dueDate → false，dueDate + 1s → true。差一秒，结论翻转。
+    function test_Event_Settled_OneSecondAfterDueIsOverdue() public {
+        uint256 id = _issueConfirmed();
+        vm.warp(dueDate + 1);
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNoteRegistry.NoteSettled(
+            id, core, supplierA, FACE, BANK_REF_2, uint64(block.timestamp), true
+        );
+        vm.prank(core);
         note.settle(id, BANK_REF_2);
     }
 
@@ -294,7 +352,7 @@ contract ReceivableNoteRegistryTest is Test {
         vm.prank(supplierA);
         note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
 
-        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        (uint256 interest, uint256 bps, ) = note.discountYieldBps(id);
         assertEq(interest, FACE - DISCOUNT_PRICE, "interest = face - paid");
 
         // 年化 = 3万 / 97万 × 365 / 90 × 10000 ≈ 1254 bps
@@ -306,22 +364,105 @@ contract ReceivableNoteRegistryTest is Test {
 
     /// @dev 回归测试①：结算之后还能不能查到贴现息和年化。
     ///      修复前的判据是 status != Discounted，一结算就返回 (0,0)。
-    ///      现在：interest 和 bps 都必须活着，而且 bps 与贴现当天完全一致。
+    ///      这一条**恰好在到期日结算**，所以实际持有天数 = 合同期限 90 天，bps 不变。
+    ///      「提前/逾期结算会改变 bps」由下面两条专门验证 —— 别把这里的相等
+    ///      误读成「结算永远不改变年化」。
     function test_YieldBps_StillQueryableAfterSettle() public {
         uint256 id = _issueConfirmed();
         vm.prank(supplierA);
         note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
 
-        (uint256 interestOnDay0, uint256 bpsOnDay0) = note.discountYieldBps(id);
+        (uint256 interestOnDay0, uint256 bpsOnDay0, ) = note.discountYieldBps(id);
         assertEq(interestOnDay0, FACE - DISCOUNT_PRICE, "day0: interest");
 
         vm.warp(dueDate);
         vm.prank(core);
         note.settle(id, BANK_REF_2);
 
-        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        (uint256 interest, uint256 bps, ) = note.discountYieldBps(id);
         assertEq(interest, FACE - DISCOUNT_PRICE, "after settle: interest is permanent");
-        assertEq(bps, bpsOnDay0, "after settle: bps stays frozen at contract rate");
+        assertEq(bps, bpsOnDay0, "settled exactly on due date -> actual == contract");
+    }
+
+    /// @dev 【2026-11-11 本轮核心】提前结算 → 分母变小 → **实际年化高于合同年化**。
+    ///      这是「settle 时把 discountTermDays 从合同期限改写为实际持有天数」带来的效果：
+    ///      以前链上永远只能给合同数（1254），实际赚了多少只有链下能算。
+    ///      注意 isActual 标记：同一个 1128，标记为 false 时是"按合同该赚多少"，
+    ///      标记为 true 时才是"实际赚了多少"。不给标记，这个数就没法解读。
+    function test_YieldBps_ActualAfterEarlySettle() public {
+        uint256 id = _issueConfirmed();
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
+
+        (, uint256 bpsContract, bool isActualBefore) = note.discountYieldBps(id);
+        assertFalse(isActualBefore, "before settle: this is the contract rate");
+
+        // 提前 30 天结算 → 实际持有 90 - 30 = 60 天
+        vm.warp(dueDate - 30 days);
+        vm.prank(core);
+        note.settle(id, BANK_REF_2);
+
+        (uint256 interest, uint256 bpsActual, bool isActual) = note.discountYieldBps(id);
+        assertEq(note.getNote(id).discountTermDays, 60, "term rewritten to actual 60 days");
+        assertTrue(isActual, "after settle: this is the actual rate");
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest unchanged");
+        assertGt(bpsActual, bpsContract, "early settle -> higher actual yield");
+        assertEq(bpsActual, _expectedBps(FACE, DISCOUNT_PRICE, 60), "60-day annualized");
+    }
+
+    /// @dev 逾期 10 天结算 → 分母变大 → **实际年化低于合同年化**。
+    ///      这条同时是「无符号减法下溢」的守门员：不分支写就会在这里 Panic(0x11)。
+    function test_YieldBps_ActualAfterLateSettle() public {
+        uint256 id = _issueConfirmed();
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
+
+        (, uint256 bpsContract, ) = note.discountYieldBps(id);
+
+        vm.warp(dueDate + 10 days);
+        vm.prank(core);
+        note.settle(id, BANK_REF_2);
+
+        (uint256 interest, uint256 bpsActual, bool isActual) = note.discountYieldBps(id);
+        assertEq(note.getNote(id).discountTermDays, 100, "term rewritten to actual 100 days");
+        assertTrue(isActual, "after settle: this is the actual rate");
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest unchanged");
+        assertLt(bpsActual, bpsContract, "late settle -> lower actual yield");
+        assertEq(bpsActual, _expectedBps(FACE, DISCOUNT_PRICE, 100), "100-day annualized");
+    }
+
+    /// @dev 没贴现的票（Confirmed → Redeemed）结算时**不能碰** discountTermDays：
+    ///      它没有「资金方持有期」这个概念。照公式改会把「核心企业晚付了几天」
+    ///      写进这个字段，两个月后没人看得懂它是什么。
+    function test_Settle_ConfirmedNoteDoesNotTouchTermDays() public {
+        uint256 id = _issueConfirmed(); // 未贴现，直接结算
+
+        vm.warp(dueDate + 10 days);
+        vm.prank(core);
+        note.settle(id, BANK_REF_2);
+
+        assertEq(note.getNote(id).discountTermDays, 0, "no discount -> term stays 0");
+        (uint256 interest, uint256 bps, bool isActual) = note.discountYieldBps(id);
+        assertEq(interest, 0, "never discounted -> no interest");
+        assertEq(bps, 0, "never discounted -> no bps");
+        assertFalse(isActual, "never discounted -> isActual false");
+    }
+
+    /// @dev 极端但合法：贴现当天就结算 → 实际持有 0 天 → 年化没有分母，返回 bps = 0；
+    ///      但 interest 照常返回，因为「赚了多少」是永久事实，不需要分母。
+    function test_YieldBps_SameDaySettle() public {
+        uint256 id = _issueConfirmed();
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE, BANK_REF);
+
+        vm.prank(core);
+        note.settle(id, BANK_REF_2); // 同一秒，0 天持有
+
+        (uint256 interest, uint256 bps, bool isActual) = note.discountYieldBps(id);
+        assertEq(note.getNote(id).discountTermDays, 0, "0-day holding period");
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest still there");
+        assertEq(bps, 0, "no denominator -> bps 0");
+        assertTrue(isActual, "isActual still true (it did settle)");
     }
 
     /// @dev 回归测试②：逾期未结算 —— 旧代码在这里会 Panic(0x11)。
@@ -335,7 +476,7 @@ contract ReceivableNoteRegistryTest is Test {
 
         vm.warp(dueDate + 100 days);
 
-        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        (uint256 interest, uint256 bps, ) = note.discountYieldBps(id);
         assertEq(interest, FACE - DISCOUNT_PRICE, "overdue: interest still there");
         assertEq(bps, _expectedBps(FACE, DISCOUNT_PRICE, 90), "overdue: bps frozen, no panic");
     }
@@ -345,7 +486,7 @@ contract ReceivableNoteRegistryTest is Test {
     function test_YieldBps_NeverDiscounted() public {
         uint256 id = _issueConfirmed();
 
-        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        (uint256 interest, uint256 bps, ) = note.discountYieldBps(id);
         assertEq(interest, 0, "never discounted: interest = 0");
         assertEq(bps, 0, "never discounted: bps = 0");
     }
@@ -365,19 +506,19 @@ contract ReceivableNoteRegistryTest is Test {
 
         uint256 expected = _expectedBps(FACE, DISCOUNT_PRICE, 90);
 
-        (, uint256 bpsDay0) = note.discountYieldBps(id);
+        (, uint256 bpsDay0, ) = note.discountYieldBps(id);
         assertEq(bpsDay0, expected, "day 0 = 1254");
 
         vm.warp(block.timestamp + 45 days);
-        (, uint256 bpsDay45) = note.discountYieldBps(id);
+        (, uint256 bpsDay45, ) = note.discountYieldBps(id);
         assertEq(bpsDay45, expected, "day 45 must not drift (old code: 2508)");
 
         vm.warp(dueDate - 1);
-        (, uint256 bpsDay89) = note.discountYieldBps(id);
+        (, uint256 bpsDay89, ) = note.discountYieldBps(id);
         assertEq(bpsDay89, expected, "day 89 must not explode (old code: 112886)");
 
         vm.warp(dueDate + 100 days);
-        (, uint256 bpsAfter) = note.discountYieldBps(id);
+        (, uint256 bpsAfter, ) = note.discountYieldBps(id);
         assertEq(bpsAfter, expected, "after due: still frozen (old code: 0)");
     }
 
@@ -392,7 +533,7 @@ contract ReceivableNoteRegistryTest is Test {
 
         assertEq(note.getNote(id).discountTermDays, 0, "term rounds down to 0");
 
-        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        (uint256 interest, uint256 bps, ) = note.discountYieldBps(id);
         assertEq(interest, FACE - DISCOUNT_PRICE, "interest still computable");
         assertEq(bps, 0, "no denominator, bps = 0");
     }

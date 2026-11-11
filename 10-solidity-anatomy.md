@@ -65,6 +65,7 @@
 | 29 | 实际付款日要不要记？`dueDate - realPaymentDay` 能还原当时的年化吗 | §9.10 末尾·提问 29 |
 | 30 | 事件里加个时间戳，能不花成本拿到"实际 bps"吗？为什么合约自己读不到事件 | §9.10 末尾·提问 30 |
 | 31 | `discountYieldBps` 的分母为什么不能是"还剩几天到期"？固定分子配缩小的分母等于倒计时 | §9.10 末尾·提问 31 |
+| 32 | `discountTermDays` 该在 settle 时改成实际天数吗？那个 `NotDue` 是不是让逾期的票永远结不了 | §9.10 末尾·提问 32 |
 
 ---
 
@@ -2690,6 +2691,12 @@ function redeem(uint256 id) external payable exists(id) {
 
 这个函数值得逐行读，因为**它是整份合约里唯一有真钱流动的地方**。
 
+> ⚠️ **后来的一处删改（提问 32）**：上面代码里的 `if (block.timestamp < n.dueDate) revert NotDue(n.dueDate);` 已经在 2026-11-11 删掉了。
+> 理由不是"它拦了逾期"（恰恰相反，它拦的是「还没到期」，超期照样能兑付），
+> 而是它堵死了**提前付款** —— 核心企业想早点还钱必须等到到期日，链上记下的时间
+> 就变成「企业想起来的时刻」而非「钱到账的时刻」。
+> 删掉之后改用事件里的 `bool isOverDue` 标记是否逾期。下面讲 CEI 的部分不受影响。
+
 **① `payable` 是什么**
 
 ```solidity
@@ -3423,6 +3430,178 @@ bps = (interest * 365 * 10_000) / (uint256(n.discountPrice) * n.discountTermDays
 
 > 复盘一句：我上一轮其实已经写出了正确的公式（提问 30 的 `holdingDays = settledAt − discountedAt`），也承认了 `dueDate − paidAt` 不是持有期 —— **但没有回头去看 `discountYieldBps` 里的分母就是 `dueDate − now`**。同一个错误，在文档里认了一遍，在代码里漏了一遍。**下次遇到"这个字段不是我要的"这类结论，要立刻全仓搜一遍它在哪还被当正确值用。**
 
+#### ❓ 提问 32：`discountTermDays` 该在 `settle` 里改成"实际天数"吗？那个 `NotDue` 是不是让逾期的票永远结不了？
+
+> 用户原话：「你这个 discountTermDays 是在 function discount 的时候设置的，表示里到期有多少天，但是我觉得应该是在 function settle 的时候更新成真正的天数，看是提前还了，还是超过 dueDate，然后看这个 discountTermDays 相应的减少或增加天数。另外，在 function settle 里，是不是不应该有 `if (block.timestamp < n.dueDate) revert NotDue(n.dueDate);` 如果有这个的话就意味着这个票如果超期了，就永远不能 settle 了？所以，应该不要这个判断，然后 event NoteSettled 里，可以增加一个 isOverDue」
+
+三句话：一句读反了方向、一句揪出了真 bug、一句是好主意。
+
+##### 一、先把这个 `if` 的方向读对
+
+```solidity
+if (block.timestamp < n.dueDate) revert NotDue(n.dueDate);
+```
+
+逐字读：**现在 < 到期日 → 报错**。也就是「没到期不许结算」。
+
+| 时点 | `now < dueDate` | 结果 |
+|---|---|---|
+| 到期前 | 真 | **revert** ❌ |
+| 到期日当天 | 假 | 通过 ✅ |
+| 逾期 30 天 | 假 | **通过** ✅ |
+
+所以「超期了就永远不能 settle」是把不等号读反了：真实行为正相反 —— **越晚越能结算，早一天反而被拦住**。
+
+验证起来一秒：`test_Event_Settled_Overdue` 里 `vm.warp(dueDate + 30 days)` 再调 `settle`，成功。这条测试在本轮之前就存在（`test_Settle_AccumulatesTotalSettled` 之类一直这么跑），只是没人特意去念那个不等号。
+
+> 这类"读代码读反方向"的坑有个特征：**它不会报错，只会让你对系统的行为产生一个完全相反的预期**。而代码跑得好好的，所以永远发现不了。唯一的防法是每次看到比较运算符，都把三个时点（前 / 正好 / 后）各代一遍。
+
+##### 二、但它确实堵死了一件事：提前付款
+
+方向虽然读反了，可**用户要删它的理由成立**——只是理由得换一个：它拦的是「提前结算」，而提前付款在业务上完全正当。
+
+核心企业提前还款，对票据信用是加分项；银行提前收回本金，年化反而更高（持有期短了）。旧代码却要求它"等到到期日再来登记"，于是链上记下的时间变成**「核心企业想起来上链的那一刻」**，而不是「钱真的到账的那一刻」——存证版最该保真的就是这个时刻。
+
+删掉安全吗？没有套利空间：
+
+- 调用方必须是 `coreEnterprise`（付款方本人）
+- 结算要付出全额 `amount`，早付只是让自己少占款
+- 不存在「早结算能多拿钱」的路径
+
+三版一致删掉，`error NotDue` 也一并删（悬空的错误声明会让读代码的人以为检查还在，比没有更误导）。
+
+##### 三、`isOverDue`：明明算得出来，为什么还要存进事件
+
+有了 `settledAt` 和 `dueDate`，「逾期没逾期」链下当然比得出来（`settledAt > dueDate`）。那为什么还要多花 ~300 gas 存一个 bool？
+
+**因为它的价值不是"算不算得出"，是"谁来定义边界"。**
+
+`settledAt == dueDate` 到底算不算逾期？到期日当天 23:59 付款算不算？不写进事件，十个索引器会给出十个答案（有人 `>=`、有人 `>`、有人按天取整）。写进事件之后，链下拿到的是**合约的判决**，不是各自的推断。
+
+还有一个隐性好处：它是**自校验字段**。若某索引器解出的 `isOverDue` 与 `settledAt > dueDate` 不一致，说明它解错了 —— 不用等到月度对账才发现。
+
+边界夹得很死，两条测试一左一右：
+
+```solidity
+vm.warp(dueDate);        // 正好到期日 → isOverDue = false
+vm.warp(dueDate + 1);    // 晚 1 秒     → isOverDue = true
+```
+
+差一秒，结论翻转。这就是"严格大于"和"大于等于"的分水岭。
+
+##### 四、`discountTermDays` 在 `settle` 时改写：做了，但代价在精度不在 gas
+
+这是三句里最有分量的一句。改完之后，`discountTermDays` 一生有两个值：
+
+| 时点 | 值 | 语义 |
+|---|---|---|
+| `discount()` | `(dueDate − now) / 1 days` | **合同期限**（报价分母） |
+| `settle()` | `合同期限 ± 偏差天数` | **实际持有天数**（结算分母） |
+
+会计上这叫「预提 → 实结」：先按合同记一笔预期，结算时按实际修正。
+
+于是 `discountYieldBps()` 在结算后自动变成实际年化，不用链下再从两条日志里算一遍：
+
+```
+USD 版实测（票面 100 万 / 实付 98 万 / 90 天期，提前 30 天兑付）
+  合同年化(bps) : 827      ← 贴现当天算出来，钉住
+  实际年化(bps) : 1241     ← 只持有 60 天，年化被拉高 414 个基点
+```
+
+代价一个都不是 gas，是**精度**。
+
+```python
+# 20000 组随机样本，合同 90 天，结算日提前/逾期 ±30 天
+样本 20000  有偏差 10078 (50.4%)  最大偏差 1 天
+```
+
+**为什么必然有 1 天误差**：`discountTermDays` 存的是 `floor((due − disc)/1days)`，贴现那一刻的**秒级余数已经丢了**。结算时只能用 `term + floor((set − due)/1days)` 反推，两次取整的余数叠加，就有了那 1 天。
+
+数学上就是这一句：`floor(a/D) + floor(b/D) ≠ floor((a+b)/D)`，除非两个余数加起来不到一个 D。
+
+1 天 ≈ 14 bps（90 天期口径）。对本金 100 万的票，等于 140 元左右。
+
+要秒级精度只有一条路：把 `discountedAt`（uint64）落 storage —— 而 slot1 已经满了，**那是新开第 6 个槽，20,000 gas**。
+
+所以最终形态是两种精度并存，各司其职：
+
+| 用途 | 来源 | 精度 | 成本 |
+|---|---|---|---|
+| 链上即时查询 / 合约间调用 | `discountYieldBps()` | 天级（±1 天） | 0 |
+| 报表、审计、监管报送 | `discountedAt` − `settledAt` | **秒级** | 0（读日志） |
+
+##### 五、真正花时间的地方：编译器什么时候肯合并两次 SSTORE
+
+这部分比结论值钱，因为我在同一个坑里摔了三次。
+
+`n.status` 和 `n.discountTermDays` 都在 slot1。理论上两次赋值应该合成一次 SSTORE。实测呢？
+
+**第一次探针**：把"多写一个字段"和"只写 status"放一起比，测出覆盖版便宜 17,075 gas。荒谬。原因是 `totalSettled` 是共享变量，第二次调用命中了第一次留下的**暖槽**（2,900 vs 20,000）。改用 `mapping(id => uint256)` 让两边都写冷槽，才公平。
+
+**第二次探针**：测出 **+25 gas**。于是我以为"几乎免费"，还写进了注释。
+
+**跑真实合约**：`usd.redeem` 从 77,923 涨到 **81,121（+3,198）**。差 2,900 —— 正好一次完整 SSTORE。
+
+**第三次探针**，把四种写法摆一起：
+
+| 写法 | gas（基线 27,036） | 差值 |
+|---|---|---|
+| A 只写 `status` | 27,036 | — |
+| B 写在 private 子函数里 | 27,383 | +347 |
+| C 内联，两次写相邻 | **27,005** | **−31** |
+| D 内联 + 分支 + 末尾单次写 | 27,554 | +518 |
+
+C 比基线还便宜 —— 说明编译器**确实**会合并，把整个 slot 一次写下去。
+
+那真实合约为什么没合并？因为我把逻辑放进了 `_updateActualTerm(n)`，而它**开头有一个 early return**：
+
+```solidity
+if (n.discountPrice == 0) return;   // ← 就是这一行
+```
+
+编译器看到「存在一条不写 `discountTermDays` 的路径」，就不敢把这次写和 `status` 的写合并——合并意味着无条件写整个 slot，语义变了。
+
+**规则总结**：编译器合并同槽写入要同时满足
+
+1. 两次写在同一作用域（跨函数边界不看）
+2. 两次写都**必然执行**（有 early return / 抛异常 / 条件分支就会放弃）
+
+改成「先算出结果，再和 `status` 相邻着无条件写」之后：
+
+```solidity
+uint16 newTerm = n.discountTermDays;
+if (s == Status.Discounted) newTerm = _actualTermDays(n);  // 只算，不写
+n.status = Status.Redeemed;
+n.discountTermDays = newTerm;    // ← 和上面相邻、无条件
+```
+
+`usd.redeem` 的增量从 **+3,198 降到 +1,011**，省掉 2,187。
+
+> 顺手一个细节：判断「贴过现吗」用 `s == Status.Discounted` 而不是 `n.discountPrice != 0`。前者复用上面刚读出来的 slot1（暖），后者要冷读一次 slot2（+2,100 gas）。在 `redeem` 允许的状态范围（`Confirmed` / `Discounted`）内，两者等价。
+
+##### 六、现在的口径表（从三个变四个）
+
+| 数 | 在哪 | 谁算 | 精度 |
+|---|---|---|---|
+| 贴现息 `interest` | storage | 链上，永久 | 精确 |
+| 合同年化 | storage（结算前） | 链上 | 天级 |
+| **实际年化** | storage（结算后） | **链上** | 天级 ±1 天 |
+| 实际年化（精确） | 两条事件的时间戳 | 链下 | 秒级 |
+
+`discountYieldBps()` 现在返回三个值，第三个是**口径标记**：
+
+```solidity
+function discountYieldBps(uint256 id)
+    external view
+    returns (uint256 interest, uint256 bps, bool isActual)
+```
+
+这个 bool 不是锦上添花，是函数能不能被用的前提：同样是 1128，`isActual=false` 时它是"按合同该赚多少"，`isActual=true` 时才是"实际赚了多少"。不告诉调用方，这个数就没法解读——而"一个字段两种含义"正是这轮改动最大的风险点。
+
+##### 七、一句话收口
+
+**`isOverDue` 那一行是免费的确定性；`discountTermDays` 的改写在 gas 上几乎免费（+1,011 / 77,923 ≈ 1.3%），代价是 50% 概率差 1 天 —— 换来"结算后链上直接能查实际年化"这件事，值。**
+
 ---
 
 ### 9.11 第 292–296 行：一段没有代码的注释
@@ -3835,7 +4014,9 @@ function expectRevert(bytes calldata revertData) external;     // 要求 data �
 
 因为 `expectRevert(bytes4)` 要求"**恰好等于 4 字节**"，而带参数的 error 实际吐出的是 68 字节。**长度都不一样，不可能相等。**
 
-我把这条硬规则套到你的合约上，**17 个 error** 正好分成两堆（11 + 6）：
+我把这条硬规则套到你的合约上，**17 个 error** 正好分成两堆（11 + 6）。
+> 注：其中 `NotDue(uint64)` 后来在提问 32 被删掉了（`redeem` / `settle` 不再要求"必须到期后"），
+> 所以现在的合约是 16 个。这张表按当时的代码记录，分类规则不变。
 
 | 只有 4 字节（写 `.selector` 就够） | 带参数（必须 `abi.encodeWithSelector`） |
 | --- | --- |
@@ -3843,7 +4024,7 @@ function expectRevert(bytes calldata revertData) external;     // 要求 data �
 | `NotAdmin()` | `InvoiceAlreadyUsed(bytes32 invoiceHash, uint256 existingId)` |
 | `NotHolder()` | `DiscountTooHigh(uint96 payAmount, uint96 faceValue)` |
 | `NotFinancier()` | `AmountMismatch(uint256 sent, uint256 required)` |
-| `NoteNotExist()` | `NotDue(uint64 dueDate)` |
+| `NoteNotExist()` | ~~`NotDue(uint64 dueDate)`~~（已删） |
 | `ZeroAddress()` | `SameAsTheOldAdmin(address pendingAdmin)` |
 | `ZeroAmount()` | |
 | `DueDateInPast()` | |

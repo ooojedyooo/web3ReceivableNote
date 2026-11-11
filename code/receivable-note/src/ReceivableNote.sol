@@ -151,7 +151,8 @@ contract ReceivableNote {
         address indexed issuer,
         address indexed holder,
         uint96 amount,
-        uint64 redeemedAt // 持有期终点。链下：bps = 息×365×10000 / (实付×持有天数)
+        uint64 redeemedAt, // 持有期终点。链下：bps = 息×365×10000 / (实付×持有天数)
+        bool isOverDue // 兑付时是否已过到期日（严格大于才算，当天算正常履约）
     );
     event NoteVoided(uint256 indexed id, address indexed by);
     event FinancierSet(address indexed financier, bool allowed);
@@ -177,7 +178,7 @@ contract ReceivableNote {
     error DiscountTooHigh(uint96 payAmount, uint96 faceValue);
     error AmountMismatch(uint256 sent, uint256 required);
     error TransferToSelf();
-    error NotDue(uint64 dueDate);
+    // 【2026-11-11 已删除 NotDue】redeem 不再要求「必须到期后」，改用事件里的 isOverDue。
     error EthTransferFailed();
 
     error SameAsTheOldAdmin(address pendingAdmin);
@@ -369,10 +370,17 @@ contract ReceivableNote {
         emit NoteDiscounted(id, from, financier, payAmount, uint64(block.timestamp));
     }
 
-    /// @notice 第四步：兑付。到期日，核心企业把票面金额付给当前持票人
+    /// @notice 第四步：兑付。核心企业把票面金额付给当前持票人（可早于到期日）
     /// @dev 这是整个合约里唯一「资金真正移动」的地方，因此严格按 CEI 顺序写：
     ///      Checks（全部校验） → Effects（先改状态） → Interactions（最后转账）
     ///      顺序颠倒就是经典重入漏洞。第 5 讲说的「合约里有真钱的地方最危险」，就是这里。
+    ///
+    ///      【2026-11-11 去掉了 NotDue】旧代码有 `if (block.timestamp < n.dueDate) revert NotDue(...)`。
+    ///      它拦的是「还没到期」，**不拦逾期**（now > dueDate 时条件为假，兑付照常通过）——
+    ///      所以「超期了就永远不能兑付」是把方向读反了，真实行为正相反：越晚越能兑付。
+    ///      删掉的理由是它堵死了**提前兑付**：核心企业想早点还钱（对票据信用是加分项）
+    ///      却必须等到到期日，于是链上记下的时间变成「企业想起来的时刻」而非「钱到账的时刻」。
+    ///      没有套利空间：调用方必须是 coreEnterprise（付款方），且要付满 msg.value == amount。
     function redeem(uint256 id) external payable exists(id) {
         Note storage n = _notes[id];
 
@@ -382,20 +390,20 @@ contract ReceivableNote {
         if (s != Status.Confirmed && s != Status.Discounted) {
             revert InvalidStatus(uint8(s), uint8(Status.Confirmed));
         }
-        // 到期判断用 block.timestamp 是合理的：验证者只能微调十几秒，
-        // 而业务上的「到期」精度是天。真正不能用 timestamp 的是抽奖、随机数这类场景。
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp < n.dueDate) revert NotDue(n.dueDate);
         if (msg.value != n.amount) revert AmountMismatch(msg.value, n.amount);
 
         // --- Effects：先落状态，再转账。顺序不能反。 ---
         uint96 amount = n.amount;
         address payable payee = payable(n.holder);
+        // 逾期判定抢在写 status 之前：写完之后「本来就逾期」和「刚被标成已兑付」就分不清了。
+        // 严格大于才算：到期日当天兑付属于正常履约，不该背逾期记录。
+        // forge-lint: disable-next-line(block-timestamp) 业务精度是天，验证者只能微调十几秒
+        bool isOverDue = block.timestamp > n.dueDate;
         n.status = Status.Redeemed;
 
         // 事件放在外部调用之前：万一后续失败，整笔交易连同这条 log 一起回滚，结果等价；
         // 但放在之后会留下「重入时日志顺序错乱」的隐患（forge lint 的 reentrancy-events 就是在报这个）。
-        emit NoteRedeemed(id, msg.sender, payee, amount, uint64(block.timestamp));
+        emit NoteRedeemed(id, msg.sender, payee, amount, uint64(block.timestamp), isOverDue);
 
         // --- Interactions：最后才动钱 ---
         (bool ok, ) = payee.call{value: amount}("");

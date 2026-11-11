@@ -523,7 +523,6 @@ redeem
   ├─【Checks】
   │   ├─ msg.sender != coreEnterprise ?  → revert NotCoreEnterprise()
   │   ├─ status 不是 Confirmed/Discounted ? → revert InvalidStatus
-  │   ├─ block.timestamp < dueDate ?     → revert NotDue        （步骤⑦保证了通过）
   │   └─ msg.value != amount ?           → revert AmountMismatch
   │
   ├─【Effects】先改状态
@@ -531,11 +530,17 @@ redeem
   │   ├─ payee = payable(holder) = BANK
   │   └─ status = Redeemed
   │
-  ├─ emit NoteRedeemed(1, core, BANK, 1e18)
+  ├─ emit NoteRedeemed(1, core, BANK, 1e18, settledAt, isOverDue)
   │
   └─【Interactions】最后才动钱
       └─ BANK.call{value: 1e18}("")
 ```
+
+> ⚠️ 这份演示稿写于 2026-11-09。后来（提问 32）`Checks` 里的
+> `block.timestamp < dueDate → revert NotDue` 被删掉了：它拦的是「还没到期」，
+> 超期反而能通过，真正的问题是它堵死了**提前付款**。
+> 现在改用 `NoteRedeemed` 事件里的 `bool isOverDue` 标记是否逾期。
+> 步骤⑦那笔 `warp` 依然需要（否则演示的是提前兑付，与脚本预期的事件字段不符）。
 
 **为什么顺序不能反**：如果先转账，BANK 如果是个恶意合约，它可以在 `receive()` 里回调 `redeem(1)`。此时 `status` 还没改成 `Redeemed`，`Checks` 全部通过，钱会被再转一次。
 

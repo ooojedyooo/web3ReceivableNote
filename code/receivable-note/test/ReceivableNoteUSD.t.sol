@@ -124,6 +124,52 @@ contract ReceivableNoteUSDTest is Test {
         assertEq(note.totalSettled(), FACE, "cumulative settled");
     }
 
+    /// @dev 【2026-11-11 语义反转】redeem 不再要求「必须到期后」。
+    ///      旧代码有 `if (block.timestamp < n.dueDate) revert NotDue(...)`，
+    ///      它拦的是「还没到期」，**并不拦逾期**（now > dueDate 时条件为假，兑付照常通过）——
+    ///      所以「超期就永远不能兑付」是把方向读反了，真实行为正相反：越晚越能兑付。
+    ///      删掉它是为了让核心企业能提前还款，链上记的时间才是「钱真到账」的时刻。
+    function test_Redeem_BeforeDue_Succeeds() public {
+        uint256 id = _issue(uint96(FACE));
+        _approve(core, FACE);
+
+        uint256 before = usdc.balanceOf(supplierA);
+        vm.prank(core);
+        note.redeem(id);
+
+        assertEq(usdc.balanceOf(supplierA) - before, FACE, "paid before due date");
+        assertEq(
+            uint8(note.getNote(id).status), uint8(ReceivableNoteUSD.Status.Redeemed), "redeemed"
+        );
+    }
+
+    /// @dev isOverDue 的一边：到期前兑付 → false
+    function test_Event_Redeemed_EarlyNotOverdue() public {
+        uint256 id = _issue(uint96(FACE));
+        _approve(core, FACE);
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNoteUSD.NoteRedeemed(
+            id, core, supplierA, uint96(FACE), uint64(block.timestamp), false
+        );
+        vm.prank(core);
+        note.redeem(id);
+    }
+
+    /// @dev isOverDue 的另一边：逾期 10 天 → true
+    function test_Event_Redeemed_Overdue() public {
+        uint256 id = _issue(uint96(FACE));
+        _approve(core, FACE);
+        vm.warp(due + 10 days);
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNoteUSD.NoteRedeemed(
+            id, core, supplierA, uint96(FACE), uint64(block.timestamp), true
+        );
+        vm.prank(core);
+        note.redeem(id);
+    }
+
     /* ==================== 4. 稳定币可以被冻结 ==================== */
 
     /// @notice 这一条是 RWA 合规评审必问的：如果结算币发行方把持票人拉黑，会怎样？
@@ -170,7 +216,7 @@ contract ReceivableNoteUSDTest is Test {
         vm.prank(supplierB);
         note.discount(id, bank, uint96(PAY));
 
-        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        (uint256 interest, uint256 bps, ) = note.discountYieldBps(id);
         console.log(unicode"贴现息 (USDC)   :", interest / UNIT);
         console.log(unicode"年化贴现率(bps) :", bps);
 
@@ -263,7 +309,7 @@ contract ReceivableNoteUSDTest is Test {
         vm.prank(supplierA);
         note.discount(id, bank, uint96(PAY));
 
-        (uint256 interestDay0, uint256 bpsDay0) = note.discountYieldBps(id);
+        (uint256 interestDay0, uint256 bpsDay0, ) = note.discountYieldBps(id);
         assertEq(interestDay0, FACE - PAY, "day0: interest");
 
         vm.warp(due + 1);
@@ -271,12 +317,64 @@ contract ReceivableNoteUSDTest is Test {
         vm.prank(core);
         note.redeem(id);
 
-        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        (uint256 interest, uint256 bps, ) = note.discountYieldBps(id);
         console.log(unicode"兑付后贴现息    :", interest / UNIT);
         console.log(unicode"兑付后年化(bps) :", bps);
 
         assertEq(interest, FACE - PAY, "after redeem: interest is permanent");
-        assertEq(bps, bpsDay0, "after redeem: bps stays frozen at contract rate");
+        assertEq(bps, bpsDay0, "redeemed at due date -> actual == contract");
+    }
+
+    /// @dev 【2026-11-11 本轮核心】提前兑付 → 实际持有天数变小 → **实际年化高于合同年化**。
+    ///      这是「redeem 时把 discountTermDays 从合同期限改写为实际持有天数」的效果：
+    ///      以前链上永远只能给合同数，实际赚了多少只有链下能算。
+    ///      注意 isActual 标记：同一个 1128，false 时是"按合同该赚多少"，
+    ///      true 时才是"实际赚了多少"。不给标记，这个数就没法解读。
+    function test_YieldBps_ActualAfterEarlyRedeem() public {
+        uint256 id = _issue(uint96(FACE));
+        _approve(bank, PAY);
+        vm.prank(supplierA);
+        note.discount(id, bank, uint96(PAY));
+
+        (, uint256 bpsContract, bool isActualBefore) = note.discountYieldBps(id);
+        assertFalse(isActualBefore, "before redeem: this is the contract rate");
+
+        // 提前 30 天兑付 → 实际持有 90 - 30 = 60 天
+        vm.warp(due - 30 days);
+        _approve(core, FACE);
+        vm.prank(core);
+        note.redeem(id);
+
+        (uint256 interest, uint256 bpsActual, bool isActual) = note.discountYieldBps(id);
+        console.log(unicode"合同年化(bps)   :", bpsContract);
+        console.log(unicode"实际年化(bps)   :", bpsActual);
+
+        assertEq(note.getNote(id).discountTermDays, 60, "term rewritten to actual 60 days");
+        assertTrue(isActual, "after redeem: this is the actual rate");
+        assertEq(interest, FACE - PAY, "interest unchanged");
+        assertGt(bpsActual, bpsContract, "early redeem -> higher actual yield");
+    }
+
+    /// @dev 逾期 10 天兑付 → 分母变大 → **实际年化低于合同年化**。
+    ///      这条同时守着「无符号减法下溢」：不分支写就会在这里 Panic(0x11)。
+    function test_YieldBps_ActualAfterLateRedeem() public {
+        uint256 id = _issue(uint96(FACE));
+        _approve(bank, PAY);
+        vm.prank(supplierA);
+        note.discount(id, bank, uint96(PAY));
+
+        (, uint256 bpsContract, ) = note.discountYieldBps(id);
+
+        vm.warp(due + 10 days);
+        _approve(core, FACE);
+        vm.prank(core);
+        note.redeem(id);
+
+        (uint256 interest, uint256 bpsActual, bool isActual) = note.discountYieldBps(id);
+        assertEq(note.getNote(id).discountTermDays, 100, "term rewritten to actual 100 days");
+        assertTrue(isActual, "after redeem: this is the actual rate");
+        assertEq(interest, FACE - PAY, "interest unchanged");
+        assertLt(bpsActual, bpsContract, "late redeem -> lower actual yield");
     }
 
     /// @notice 回归：逾期未兑付 —— 旧代码在这里会 Panic(0x11)。
@@ -290,7 +388,7 @@ contract ReceivableNoteUSDTest is Test {
 
         vm.warp(due + 100 days);
 
-        (uint256 interest, uint256 bps) = note.discountYieldBps(id);
+        (uint256 interest, uint256 bps, ) = note.discountYieldBps(id);
         assertEq(interest, FACE - PAY, "overdue: interest still there");
         assertEq(bps, _expectedBps(FACE, PAY, 90), "overdue: bps frozen, no panic");
     }
@@ -309,11 +407,11 @@ contract ReceivableNoteUSDTest is Test {
         assertEq(expected, 827, "100w face / 98w paid / 90d = 827 bps");
 
         vm.warp(block.timestamp + 45 days);
-        (, uint256 bpsDay45) = note.discountYieldBps(id);
+        (, uint256 bpsDay45, ) = note.discountYieldBps(id);
         assertEq(bpsDay45, expected, "day 45 must not drift");
 
         vm.warp(due + 100 days);
-        (, uint256 bpsAfter) = note.discountYieldBps(id);
+        (, uint256 bpsAfter, ) = note.discountYieldBps(id);
         assertEq(bpsAfter, expected, "after due: still frozen");
     }
 }

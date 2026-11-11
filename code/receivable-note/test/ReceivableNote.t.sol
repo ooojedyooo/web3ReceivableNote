@@ -340,11 +340,69 @@ contract ReceivableNoteTest is Test {
         assertEq(address(note).balance, 0, "no residual");
     }
 
-    function test_RevertWhen_RedeemBeforeDue() public {
+    /// @dev 【2026-11-11 语义反转】这条测试原来叫 test_RevertWhen_RedeemBeforeDue，
+    ///      断言的是 `expectRevert(NotDue)`。删除 NotDue 之后反过来断：提前兑付必须成功。
+    ///
+    ///      为什么删：NotDue 拦的是「还没到期」，**并不拦逾期** ——
+    ///      now > dueDate 时 `now < dueDate` 为假，兑付照常通过。
+    ///      所以「超期了就永远不能兑付」是把方向读反了，真实行为正相反：
+    ///      越晚越能兑付，早一天反而被拦住。而提前付款恰恰是应该鼓励的
+    ///      （对票据信用是加分项，银行提前收回本金，实际年化更高）。
+    function test_Redeem_BeforeDue_Succeeds() public {
         uint256 id = _issueConfirmed();
+        uint256 balanceBefore = supplierA.balance;
 
         vm.prank(core);
-        vm.expectRevert(abi.encodeWithSelector(ReceivableNote.NotDue.selector, dueDate));
+        note.redeem{value: FACE}(id);
+
+        assertEq(
+            uint8(note.getNote(id).status), uint8(ReceivableNote.Status.Redeemed), "redeemed early"
+        );
+        assertEq(supplierA.balance - balanceBefore, FACE, "supplier got face value");
+        assertEq(address(note).balance, 0, "no residual");
+    }
+
+    /// @dev isOverDue 的一边：到期前兑付 → false。
+    ///      这个字段存在的意义不是「链下算不出来」（settledAt > dueDate 当然算得出来），
+    ///      而是把**边界定义权**收归合约：到期日当天到底算不算逾期？
+    ///      不写进事件，十个索引器会给出十个答案。
+    function test_Event_Redeemed_EarlyNotOverdue() public {
+        uint256 id = _issueConfirmed();
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNote.NoteRedeemed(
+            id, core, supplierA, FACE, uint64(block.timestamp), false
+        );
+        vm.prank(core);
+        note.redeem{value: FACE}(id);
+    }
+
+    /// @dev isOverDue 的另一边：逾期 10 天兑付 → true。
+    ///      注意旧代码在这种情况下也能兑付，行为没变；变的是链下现在能直接读标记，
+    ///      不必自己拿 dueDate 比一遍。
+    function test_Event_Redeemed_Overdue() public {
+        uint256 id = _issueConfirmed();
+        vm.warp(dueDate + 10 days);
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNote.NoteRedeemed(
+            id, core, supplierA, FACE, uint64(block.timestamp), true
+        );
+        vm.prank(core);
+        note.redeem{value: FACE}(id);
+    }
+
+    /// @dev 边界值：正好在到期日当天（block.timestamp == dueDate）→ false。
+    ///      这是「严格大于」而非「大于等于」的分水岭，也是最容易被链下写错的一格。
+    function test_Event_Redeemed_OnDueDateIsNotOverdue() public {
+        uint256 id = _issueConfirmed();
+        vm.warp(dueDate);
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceivableNote.NoteRedeemed(
+            id, core, supplierA, FACE, uint64(block.timestamp), false
+        );
+        vm.prank(core);
         note.redeem{value: FACE}(id);
     }
 
