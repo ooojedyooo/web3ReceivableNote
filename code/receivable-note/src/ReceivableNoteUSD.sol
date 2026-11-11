@@ -195,22 +195,38 @@ contract ReceivableNoteUSD {
     ///      需要「实付多少 + 票面多少」两个数才能核销应收与贴现息。
     ///      少一个字段，对账就得回合约再查一次（那是一笔额外的 RPC）。
     ///
-    ///      【2026-11-10 新增 discountedAt / redeemedAt】这两个时间戳是为了算「实际年化」：
-    ///        holdingDays = redeemedAt − discountedAt
-    ///        bps_actual  = (amount − payAmount) × 365 × 10000 / (payAmount × holdingDays)
-    ///      它和 discountYieldBps() 算的不是同一个东西：
-    ///        · discountYieldBps() = **合同年化**，分母是贴现日钉住的 discountTermDays
-    ///          （即 dueDate − discountedAt），贴现当天算出来就永久定格；
-    ///        · bps_actual = **实际年化**，分母是真实持有天数 settledAt − discountedAt，
-    ///          结算后才定死。银行提前收到钱 → 实际 > 合同；逾期 → 实际 < 合同。
-    ///      两者只在「恰好到期日结算」时才相等。
+    ///      【2026-11-10 新增 discountedAt / redeemedAt —— 2026-11-11 修正说明】
+    ///      ⚠️ 旧版注释说「这两个时间戳是为了算实际年化，而 discountYieldBps() 只给合同年化」，
+    ///      **那个说法已经过时**。2026-11-11 起，兑付时 _actualTermDays 会把 discountTermDays
+    ///      从「合同期限」改写成「实际持有天数」，于是 discountYieldBps() 自己就会切成实际口径。
+    ///      现在的真相是 —— 同一个函数，三段人生（第三个返回值 isActual 就是口径开关）：
+    ///        未贴现        → (0,   0,        false)
+    ///        贴现后未结算  → (息,  合同年化,  false)   ← 分母 = 合同期限（如 90 天）
+    ///        结算后        → (息,  实际年化,  true)    ← 分母 = 实际持有天数（如 100 天）
+    ///      同一个 1128，不看 isActual 无法解读：false 是「按合同该赚多少」，true 是「实际赚了多少」。
+    ///      「合同 vs 实际」不是两个函数，是同一个函数的两个阶段（上表后两行）。
+    ///      银行提前收到钱 → 实际 > 合同；逾期 → 实际 < 合同。
+    ///
+    ///      那这两个时间戳还留着干什么？做两件链上做不到的事：
+    ///        ① 秒级精度：discountTermDays 只到天，±1 天 ≈ ±14 bps；
+    ///        ② 独立校验：链下算一份、链上读一份，对得上才敢进报表。
+    ///      链下算法（⚠️ 别漏了除以 1 days，否则结果会小 86400 倍）：
+    ///        holdingDays = (redeemedAt − discountedAt) / 1 days
+    ///        bps_actual  = (faceValue − payAmount) × 365 × 10000 / (payAmount × holdingDays)
+    ///                      ↑ 本事件的票面   ↑ 本事件的实付
+    ///      它与链上 isActual=true 的返回值可能差 1 天 —— 因为
+    ///      floor(a/D) + floor(b/D) ≠ floor((a+b)/D)。这是刻意接受的代价：
+    ///      把 discountedAt 落 storage 要多开一个槽 = 20,000 gas（见第 10 讲提问 32）。
     ///
     ///      为什么放事件不放 storage：实测多一个 uint64 参数 +313 gas，
     ///      而新开一个 storage slot 是 20,000 gas —— 差 64 倍。
     ///      为什么不能只靠区块时间戳：eth_getLogs 返回的 log 对象没有时间字段（EIP-1474），
     ///      链下要时间就得按 blockNumber 再查一次块，等于每条日志多一次 RPC。
-    ///      ⚠️ 代价要认：LOG 是只写出口，合约内部永远读不到这两个值 ——
-    ///      想让 discountYieldBps() 自己返回实际值，只能写进 storage（见第 10 讲提问 30）。
+    ///      ⚠️ 但边界要认：LOG 是只写出口，合约内部永远读不到这两个值。
+    ///      所以 discountYieldBps() 想在结算后给出实际值，走的不是「存时间戳」这条路，
+    ///      而是在结算时把 discountTermDays 覆盖成实际天数（见 _actualTermDays）——
+    ///      用天级精度换掉一个 20,000 gas 的槽。那两个时刻到底差多少**秒**，
+    ///      永远只有这两条事件知道。
     event NoteDiscounted(
         uint256 indexed id,
         address indexed holder,

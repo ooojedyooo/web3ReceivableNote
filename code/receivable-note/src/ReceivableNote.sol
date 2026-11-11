@@ -181,14 +181,14 @@ contract ReceivableNote {
         address indexed from,
         address indexed financier,
         uint96 payAmount,
-        uint64 discountedAt // 银行的持有期起点。与下面 redeemedAt 相减 = 实际持有天数
+        uint64 discountedAt // 银行持有期起点。与 redeemedAt 相减得到的是「秒」，/1 days 才是天
     );
     event NoteRedeemed(
         uint256 indexed id,
         address indexed issuer,
         address indexed holder,
         uint96 amount,
-        uint64 redeemedAt, // 持有期终点。链下：bps = 息×365×10000 / (实付×持有天数)
+        uint64 redeemedAt, // 持有期终点。链下：holdingDays = (redeemedAt − discountedAt) / 1 days
         bool isOverDue // 兑付时是否已过到期日（严格大于才算，当天算正常履约）
     );
     event NoteVoided(uint256 indexed id, address indexed by);

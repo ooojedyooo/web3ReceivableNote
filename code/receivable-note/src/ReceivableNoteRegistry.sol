@@ -222,17 +222,28 @@ contract ReceivableNoteRegistry {
     ///      （EIP-1474：address/blockHash/data/transactionHash/blockNumber/logIndex/
     ///        transactionIndex/topics/removed），要时间就得按 blockNumber 再查一次块。
     ///
-    ///      【算实际 bps 的完整口径】两个时间戳都在事件里之后：
-    ///        holdingDays = settledAt − discountedAt        ← 真实持有天数
-    ///        bps_actual  = (amount − payAmount) × 365 × 10000 / (payAmount × holdingDays)
-    ///      它和 discountYieldBps() 算的不是同一个东西：
-    ///        · discountYieldBps() = **合同年化**，分母是贴现日钉住的 discountTermDays，
-    ///          贴现当天算出来就永久定格；
-    ///        · bps_actual = **实际年化**，分母是真实持有天数，结算后才定死。
-    ///      银行提前收到钱 → 实际 > 合同；逾期 → 实际 < 合同。只有恰好到期日结算时两者相等。
+    ///      【算实际 bps 的完整口径 —— 2026-11-11 修正】
+    ///      ⚠️ 旧版注释说「discountYieldBps() 只给合同年化、贴现当天永久定格」，已经过时：
+    ///      结算时 _actualTermDays 会把 discountTermDays 从「合同期限」改写成「实际持有天数」，
+    ///      于是同一个函数在结算后自动切成实际口径（第三个返回值 isActual 变成 true）。
+    ///        · 结算前：bps = 合同年化，分母 = 合同期限
+    ///        · 结算后：bps = 实际年化，分母 = 实际持有天数
+    ///      「合同 vs 实际」不是两个函数，是同一个函数的两段人生。不读 isActual 就无法解读这个数。
     ///
-    ///      ⚠️ LOG 是只写出口：合约内部永远读不到这两个值。想让函数自己返回实际 bps，
-    ///      只能写进 storage —— 那是另一个量级的成本（见第 10 讲提问 30）。
+    ///      这两个时间戳仍然有价值，做两件链上做不到的事：
+    ///        ① 秒级精度：discountTermDays 只到天，±1 天 ≈ ±14 bps；
+    ///        ② 独立校验：链下算一份、链上读一份，对得上才敢进报表。
+    ///      链下算法（⚠️ 别漏了除以 1 days，否则结果会小 86400 倍）：
+    ///        holdingDays = (settledAt − discountedAt) / 1 days
+    ///        bps_actual  = (amount − payAmount) × 365 × 10000 / (payAmount × holdingDays)
+    ///                      ↑ NoteSettled 的票面金额    ↑ NoteDiscounted 的实付金额
+    ///      与链上 isActual=true 的返回值可能差 1 天（floor 位置不同：floor(a/D)+floor(b/D) ≠
+    ///      floor((a+b)/D)）。这是刻意接受的代价 —— 求秒级精确要多开一个 storage 槽。
+    ///      银行提前收到钱 → 实际 > 合同；逾期 → 实际 < 合同。
+    ///
+    ///      ⚠️ LOG 是只写出口：合约内部永远读不到这两个值。所以结算后的实际 bps 不是靠
+    ///      读这些时间戳算出来的，而是靠结算时覆盖 discountTermDays（见 _actualTermDays）——
+    ///      用天级精度换掉一个 20,000 gas 的槽。秒级的真实差，只有这两条事件知道。
     ///
     ///      【2026-11-11 新增 isOverDue】为什么明明能算还要存：
     ///      有了 settledAt 和 dueDate，「逾期没逾期」链下当然比得出来（settledAt > dueDate）。
