@@ -107,6 +107,11 @@ contract ReceivableNoteRegistry {
             // 1 天 ≈ 14 bps（90 天期、1254 bps 口径）。要秒级精度只能存 discountedAt。
             // 精确值从哪来：NoteDiscounted.discountedAt 与 NoteSettled.settledAt 相减，链下算。
         uint96 discountPrice; // 贴现实收金额（0 表示未贴现）。财务用它算贴现息
+            // 它是 discountYieldBps() 的分子来源（息 = amount − discountPrice），
+            // 所以必须落 storage —— 事件里的 payAmount 合约自己读不回来。
+            // ⚠️ 字段位置与 ETH 版不同：本版 discountPrice 在 supplier 之前，ETH 版在后面。
+            //    两版都只占一个槽（12 + 20 = 32），但 getNote() 返回的 tuple 顺序不一样，
+            //    链下按位置解码时不能共用同一份代码。详见 ReceivableNote.sol 的 struct 注释。
         address supplier; // 原始债权人（不可变，审计追溯用）
         bytes32 invoiceHash; // 发票号哈希（不存明文 —— 第 1 讲的原则：链上数据永久公开）
         bytes32 settlementRef; // 结算回执（银行流水号 / 支付指令号的 keccak256）。

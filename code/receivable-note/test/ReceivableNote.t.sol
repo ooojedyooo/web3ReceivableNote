@@ -35,6 +35,7 @@ contract ReceivableNoteTest is Test {
     address internal stranger; // 路人
 
     uint96 internal constant FACE = 1_000_000 * 1e6; // 票面 100 万（6 位小数口径）
+    uint96 internal constant DISCOUNT_PRICE = 970_000 * 1e6; // 贴现实付 97 万（息 3 万）
     uint64 internal dueDate;
     bytes32 internal constant INV_001 = keccak256("INV-2026-001");
     bytes32 internal constant INV_002 = keccak256("INV-2026-002");
@@ -84,6 +85,22 @@ contract ReceivableNoteTest is Test {
         id = _issueDefault();
         vm.prank(core);
         note.confirm(id);
+    }
+
+    /// @dev 合同/实际年化的独立算法，用来和合约里的实现交叉验证。
+    ///      故意写成和合约不一样的形式（先算息、再乘），避免"抄一遍合约代码当断言"。
+    function _expectedBps(uint96 face, uint96 paid, uint256 termDays)
+        internal
+        pure
+        returns (uint256)
+    {
+        return (uint256(face - paid) * 365 * 10_000) / (uint256(paid) * termDays);
+    }
+
+    /// @dev 贴现并返回 id。ETH 版的 discount 只是登记，钱不走合约，所以不用 approve。
+    function _discountDefault(uint256 id) internal {
+        vm.prank(supplierA);
+        note.discount(id, bank, DISCOUNT_PRICE);
     }
 
     /* ================= 1. 开立 ================= */
@@ -671,4 +688,165 @@ contract ReceivableNoteTest is Test {
         note.issue(supplierA, FACE, dueDate, INV_001);
     }
 
+    /* ================= 11. 贴现息与年化（discountYieldBps） ================= */
+
+    /// @dev 没贴现的票：(0, 0, false)，不 revert。
+    ///      「没贴现」是业务上不存在，不是调用错误。
+    function test_YieldBps_NeverDiscounted() public {
+        uint256 id = _issueConfirmed();
+
+        (uint256 interest, uint256 bps, bool isActual) = note.discountYieldBps(id);
+        assertEq(interest, 0, "never discounted: interest = 0");
+        assertEq(bps, 0, "never discounted: bps = 0");
+        assertFalse(isActual, "never discounted: not an actual figure");
+    }
+
+    /// @dev 贴现当天：分母 = 合同期限 90 天，isActual = false（这是「合同年化」）。
+    function test_YieldBps_ContractRateOnDiscountDay() public {
+        uint256 id = _issueConfirmed();
+        _discountDefault(id);
+
+        (uint256 interest, uint256 bps, bool isActual) = note.discountYieldBps(id);
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest = face - paid");
+        assertEq(bps, _expectedBps(FACE, DISCOUNT_PRICE, 90), "90-day contract annualized");
+        assertFalse(isActual, "before redeem: contract rate, not actual");
+        // 顺带确认 payAmount 真的落进了 storage（这一版 2026-11-11 才加的字段）
+        assertEq(note.getNote(id).discountPrice, DISCOUNT_PRICE, "payAmount persisted");
+        assertEq(note.getNote(id).discountTermDays, 90, "term pinned at discount time");
+    }
+
+    /// @dev 【本轮核心回归】同一个 bps 在四个时点必须完全相等。
+    ///      旧实现的分母是 `dueDate − block.timestamp`，每过一天就小一点，
+    ///      于是同一笔赚 3 万的生意会走出 1254 → 2508 → 112886(1128.9%) → 0 的曲线。
+    ///      注释里写死旧代码会得到的值，将来谁把它改回去，这四条断言会立刻红。
+    function test_YieldBps_DoesNotDriftOverTime() public {
+        uint256 id = _issueConfirmed();
+        _discountDefault(id);
+
+        (, uint256 day0, ) = note.discountYieldBps(id);
+        assertEq(day0, 1254, unicode"贴现当天的合同年化 1254 bps");
+
+        vm.warp(block.timestamp + 45 days);
+        (, uint256 day45, ) = note.discountYieldBps(id);
+        assertEq(day45, day0, unicode"45 天后必须还是 1254（旧实现会算成 2508）");
+
+        vm.warp(dueDate - 1 days);
+        (, uint256 day89, ) = note.discountYieldBps(id);
+        assertEq(day89, day0, unicode"到期前一天还是 1254（旧实现会算成 112886 = 1128.9%）");
+
+        vm.warp(dueDate + 100 days);
+        (, uint256 overdue, bool isActualAfter) = note.discountYieldBps(id);
+        assertEq(overdue, day0, unicode"逾期 100 天仍是 1254（旧实现会除零返回 0）");
+        assertFalse(isActualAfter, unicode"没兑付就不算实际值");
+    }
+
+    /// @dev 提前 30 天兑付 → 实际持有 60 天 → 分母变小 → **实际年化高于合同年化**。
+    ///      这条验证 redeem() 真的把 discountTermDays 改写成了实际持有天数。
+    function test_YieldBps_ActualAfterEarlyRedeem() public {
+        uint256 id = _issueConfirmed();
+        _discountDefault(id);
+
+        (, uint256 bpsContract, bool isActualBefore) = note.discountYieldBps(id);
+        assertFalse(isActualBefore, "before redeem: contract rate");
+
+        // 提前 30 天兑付 → 实际持有 90 − 30 = 60 天
+        vm.warp(dueDate - 30 days);
+        vm.prank(core);
+        note.redeem{value: FACE}(id);
+
+        (uint256 interest, uint256 bpsActual, bool isActual) = note.discountYieldBps(id);
+        assertEq(note.getNote(id).discountTermDays, 60, "term rewritten to actual 60 days");
+        assertTrue(isActual, "after redeem: this is the actual rate");
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest unchanged");
+        assertGt(bpsActual, bpsContract, "early redeem -> higher actual yield");
+        assertEq(bpsActual, _expectedBps(FACE, DISCOUNT_PRICE, 60), "60-day annualized");
+    }
+
+    /// @dev 逾期 10 天兑付 → 分母变大 → **实际年化低于合同年化**。
+    ///      这条同时是无符号减法的守门员：不分支写就会在这里 Panic(0x11)。
+    function test_YieldBps_ActualAfterLateRedeem() public {
+        uint256 id = _issueConfirmed();
+        _discountDefault(id);
+
+        (, uint256 bpsContract, ) = note.discountYieldBps(id);
+
+        vm.warp(dueDate + 10 days);
+        vm.prank(core);
+        note.redeem{value: FACE}(id);
+
+        (uint256 interest, uint256 bpsActual, bool isActual) = note.discountYieldBps(id);
+        assertEq(note.getNote(id).discountTermDays, 100, "term rewritten to actual 100 days");
+        assertTrue(isActual, "after redeem: actual rate");
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest unchanged");
+        assertLt(bpsActual, bpsContract, "late redeem -> lower actual yield");
+        assertEq(bpsActual, _expectedBps(FACE, DISCOUNT_PRICE, 100), "100-day annualized");
+    }
+
+    /// @dev 正点兑付（到期日当天）→ 实际天数 == 合同期限，两个口径重合。
+    ///      这是三条口径（报价 / 合同 / 实际）唯一相等的时刻。
+    function test_YieldBps_OnTimeRedeemEqualsContract() public {
+        uint256 id = _issueConfirmed();
+        _discountDefault(id);
+
+        (, uint256 bpsOnDay0, ) = note.discountYieldBps(id);
+
+        vm.warp(dueDate);
+        vm.prank(core);
+        note.redeem{value: FACE}(id);
+
+        (uint256 interest, uint256 bps, bool isActual) = note.discountYieldBps(id);
+        assertEq(note.getNote(id).discountTermDays, 90, "term unchanged at 90");
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest permanent");
+        assertEq(bps, bpsOnDay0, "on time -> actual == contract");
+        assertTrue(isActual, "did redeem, so it counts as actual");
+    }
+
+    /// @dev 未贴现的票直接兑付，**不能碰** discountTermDays：
+    ///      它没有「资金方持有期」这个概念。照公式改会把「核心企业晚付了几天」
+    ///      写进这个字段，两个月后没人看得懂它是什么。
+    function test_Redeem_ConfirmedNoteDoesNotTouchTermDays() public {
+        uint256 id = _issueConfirmed(); // 未贴现，直接兑付
+
+        vm.warp(dueDate + 10 days);
+        vm.prank(core);
+        note.redeem{value: FACE}(id);
+
+        assertEq(note.getNote(id).discountTermDays, 0, "no discount -> term stays 0");
+        assertEq(note.getNote(id).discountPrice, 0, "no discount -> price stays 0");
+        (uint256 interest, uint256 bps, bool isActual) = note.discountYieldBps(id);
+        assertEq(interest, 0, "never discounted -> no interest");
+        assertEq(bps, 0, "never discounted -> no bps");
+        assertFalse(isActual, "never discounted -> isActual false");
+    }
+
+    /// @dev 极端但合法：贴现当天就兑付 → 实际持有 0 天 → 年化没有分母，返回 bps = 0；
+    ///      但 interest 照常返回，因为「赚了多少」是永久事实，不需要分母。
+    function test_YieldBps_SameDayRedeem() public {
+        uint256 id = _issueConfirmed();
+        _discountDefault(id);
+
+        vm.prank(core);
+        note.redeem{value: FACE}(id); // 同一秒，0 天持有
+
+        (uint256 interest, uint256 bps, bool isActual) = note.discountYieldBps(id);
+        assertEq(note.getNote(id).discountTermDays, 0, "0-day holding period");
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest still there");
+        assertEq(bps, 0, "no denominator -> bps 0");
+        assertTrue(isActual, "isActual still true (it did redeem)");
+    }
+
+    /// @dev 贴现时距到期不足一天 → 期限取整为 0 → 当时就没有年化可算。
+    ///      验证 discount() 里的 termDays 计算不会给出一个假的小数。
+    function test_YieldBps_DiscountedInLastHours() public {
+        uint256 id = _issueConfirmed();
+
+        vm.warp(dueDate - 1 hours); // 距到期 3600 秒 → 3600 / 86400 = 0 天
+        _discountDefault(id);
+
+        assertEq(note.getNote(id).discountTermDays, 0, "term floors to 0");
+        (uint256 interest, uint256 bps, bool isActual) = note.discountYieldBps(id);
+        assertEq(interest, FACE - DISCOUNT_PRICE, "interest still computed");
+        assertEq(bps, 0, "no denominator -> bps 0");
+        assertFalse(isActual, "not redeemed yet -> contract side");
+    }
 }

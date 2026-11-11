@@ -109,6 +109,9 @@ import sys
 raw = sys.stdin.read().strip().replace('0x','')
 words = [raw[i:i+64] for i in range(0, len(raw), 64)]
 NAMES = ['None','Issued','Confirmed','Discounted','Redeemed','Voided']
+# 字段顺序 = struct 声明顺序（不是槽位顺序的直觉）：
+#   0 issuer / 1 amount / 2 holder / 3 dueDate / 4 status
+#   5 discountTermDays / 6 supplier / 7 discountPrice / 8 invoiceHash
 print()
 print('  凭证 #1 最终状态')
 print('    开立方(核心企业) : 0x' + words[0][-40:])
@@ -116,8 +119,14 @@ print('    票面金额         : ' + str(int(words[1],16)/10**18) + ' ETH')
 print('    当前持票人       : 0x' + words[2][-40:])
 print('    到期时间戳       : ' + str(int(words[3],16)))
 print('    状态             : ' + NAMES[int(words[4],16)] + '（' + str(int(words[4],16)) + '）')
-print('    原始供应商       : 0x' + words[5][-40:] + '  ← 不可变')
-print('    发票哈希         : 0x' + words[6][:16] + '...')
+print('    计息天数         : ' + str(int(words[5],16)) + ' 天  ← 兑付时改写成实际持有天数')
+print('    原始供应商       : 0x' + words[6][-40:] + '  ← 不可变')
+print('    贴现实付         : ' + str(int(words[7],16)/10**18) + ' ETH')
+print('    发票哈希         : 0x' + words[8][:16] + '...')
 "
+echo ""
+YB=$(cast call "$NOTE" 'discountYieldBps(uint256)(uint256,uint256,bool)' 1 --rpc-url "$RPC")
+set -- $YB
+echo "  贴现收益 : $(python -c "print($1/10**18)") ETH，年化 $2 bps，isActual=$3"
 echo ""
 echo "  银行赚了 0.02 ETH（票面 1.00 - 买入价 0.98），核心企业按票面结清。"

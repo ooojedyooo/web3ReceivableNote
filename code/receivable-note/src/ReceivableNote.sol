@@ -39,9 +39,32 @@ contract ReceivableNote {
     ///      同样的字段如果顺序写乱，会白白多占 1–2 个 slot，每次读写都多花钱。
     ///      这就是第 5 讲的槽位知识落地：
     ///      slot0: issuer(20) + amount(12) = 32 字节，正好塞满
-    ///      slot1: holder(20) + dueDate(8) + status(1) = 29 字节，剩 3 字节padding
-    ///      slot2: supplier(20) ← bytes32 塞不下，只能自己一个 slot
+    ///      slot1: holder(20) + dueDate(8) + status(1) + discountTermDays(2) = 31 字节，剩 1 字节
+    ///      slot2: supplier(20) + discountPrice(12) = 32 字节，正好塞满
     ///      slot3: invoiceHash(32)
+    ///
+    ///      【2026-11-11 新增 discountTermDays / discountPrice，一个槽都没多占】
+    ///      这两个字段是为了让 discountYieldBps() 能算年化（见该函数注释）：
+    ///        · discountPrice 必须落 storage —— 它是年化的分母（银行掏了多少本金）。
+    ///          在这之前 ETH 版**故意不存**它：钱不走合约，payAmount 只进 NoteDiscounted 事件。
+    ///          代价从 0 变成一次真实写入（见 discount() 里的 gas 说明），
+    ///          换来的是「贴现条款在链上留档」而不是「只在日志里飘着」。
+    ///        · discountTermDays 存的是计息天数，贴现时写合同期限、兑付时改写实际持有天数。
+    ///
+    ///      ⚠️ 字段顺序不能动。这里能零成本塞进去纯属布局运气：
+    ///        · discountTermDays(2B) 只能跟在 status 后面补 slot1 剩下的 3 字节；
+    ///        · discountPrice(12B) 只能跟在 supplier(20B) 后面补满 slot2。
+    ///        若把 discountTermDays 挪到 supplier 之后（slot2 已满），它会被挤到 slot3 开头，
+    ///        把 invoiceHash 顶到 slot4 —— 整份凭证从 4 个槽变 5 个，每张票多花 20,000 gas。
+    ///
+    ///      ⚠️ 注意：本版的 discountPrice 在 supplier **之后**，
+    ///      而 USD / Registry 版是 discountPrice 在 supplier **之前**。两版都是 4 / 5 个槽，
+    ///      但 getNote() 返回的 tuple 顺序因此完全不同（ABI 编码按声明顺序走，跟槽位无关）：
+    ///        ETH：… status, discountTermDays, supplier, discountPrice, invoiceHash
+    ///        USD：… status, discountTermDays, discountPrice, supplier, invoiceHash
+    ///      链下按位置解 tuple 时，这两版不能共用同一份解码代码。顺序差异是布局逼出来的：
+    ///      ETH 版的 supplier 独占 slot2 开头（因为原 struct 里它后面紧跟 bytes32 放不下），
+    ///      只有把 12 字节的 discountPrice 排在它后面才能补满；USD 版原本就是 discountPrice 在前。
     struct Note {
         address issuer;      // 开立方 = 核心企业 = 到期付款人
         uint96 amount;       // 票面金额（最小单位，见 decimals 约定）
@@ -50,9 +73,23 @@ contract ReceivableNote {
                              // 陷阱：uint96(x) 是「静默截断」，高位直接丢掉、不报错（实测 2^256-1 → 2^96-1），
                              // 所以每次从 uint256 转进来之前都必须先校验 <= type(uint96).max。
         address holder;      // 当前持票人（会变）
-        uint64 dueDate;      // 到期时间戳（8 字节：20 + 8 + 1 = 29，和第 4 个字段挤在同一个槽）
+        uint64 dueDate;      // 到期时间戳（8 字节：20 + 8 + 1 = 29，和第 5 个字段挤在同一个槽）
         Status status;       // 当前状态（1 字节）
+        uint16 discountTermDays; // 计息天数（天）。0 = 未贴现，或持有不足一天。
+            // 这个字段一生有两个值，靠贴现/兑付两个动作切换：
+            //   贴现当天置为「合同期限」 = (dueDate − now) / 1 days
+            //   兑付当天改写为「实际持有天数」= 合同期限 ± 与到期日的偏差天数
+            // 为什么要存：年化 = 息 / 本金 × 365 / **计息天数**。
+            // 若拿「查询这一刻到到期还有几天」当分母，那数每天在缩，而息是贴现日锁死的，
+            // 固定分子 ÷ 缩小的分母 = 一条单调爆炸的曲线（实测同一张票能算出 1128% 年化）。
+            // 2 万组随机样本实测：天级口径约 50% 与秒级真值差 1 天（≈14 bps），
+            // 要更准只能再存一个 discountedAt(uint64) —— 那就要新开 slot，20,000 gas。
         address supplier;    // 原始债权人（不可变，审计追溯用）
+        uint96 discountPrice; // 贴现实收金额（0 = 未贴现）。年化的分母 = 银行真正掏出去的本金。
+            // 注意它不是「付给供应商的钱」—— 那是 amount 的一部分性质；它是「银行买这张票花了多少」。
+            // 这一版在 2026-11-11 之前**刻意不要它**：贴现走链下，payAmount 只进 NoteDiscounted 事件，
+            // 省掉一次 SSTORE。代价是 discountYieldBps() 根本没法实现 —— 息 = amount − discountPrice，
+            // 缺一个数就无从谈起。既然要能查「这张票贴现时什么价、赚了多少」，这个字段躲不掉。
         bytes32 invoiceHash; // 发票号哈希（不存明文 —— 第 1 讲的原则）
     }
 
@@ -179,6 +216,7 @@ contract ReceivableNote {
     error AmountMismatch(uint256 sent, uint256 required);
     error TransferToSelf();
     // 【2026-11-11 已删除 NotDue】redeem 不再要求「必须到期后」，改用事件里的 isOverDue。
+    error TermTooLong(uint256 days_);
     error EthTransferFailed();
 
     error SameAsTheOldAdmin(address pendingAdmin);
@@ -306,7 +344,9 @@ contract ReceivableNote {
             holder: supplier,
             dueDate: dueDate,
             status: Status.Issued,
+            discountTermDays: 0, // 未贴现 → 计息天数未知，贴现那一刻才写
             supplier: supplier,
+            discountPrice: 0, // 未贴现 → 银行还没掏钱，分母为 0（discountYieldBps 据此判「没贴过现」）
             invoiceHash: invoiceHash
         });
         invoiceToNote[invoiceHash] = id;
@@ -346,9 +386,11 @@ contract ReceivableNote {
     /// @notice 第三步（另一条路）：贴现。持票人把凭证折价卖给白名单金融机构
     /// @param financier 受让方，必须在白名单里
     /// @param payAmount 金融机构实际支付给持票人的金额（< 票面金额，差额即贴现息）
-    /// @dev 贴现的结算（payAmount 那笔钱）本版本走链下或另接稳定币合约。
-    ///      为什么不在这个合约里收钱？因为把「凭证登记」和「资金清算」耦合在一起，
-    ///      会让合约同时承担两类风险。RWA 项目的通行做法是拆成两个合约，各管一段。
+    ///      【2026-11-11 起 payAmount 落进 storage（discountPrice）】
+    ///      这一版原本**刻意不存**它：钱不走合约，payAmount 只进 NoteDiscounted 事件，
+    ///      省掉一次 SSTORE。代价是 discountYieldBps() 算不出来 —— 息 = amount − discountPrice，
+    ///      缺一个数就无从谈起。既然要留「这张票贴现时什么价」的链上档案，这个字段躲不掉。
+    ///      代价是 slot2 的一次冷写：2,100（冷访问）+ 2,900（非零→非零）≈ 5,000 gas，每张票一次。
     function discount(uint256 id, address financier, uint96 payAmount)
         external
         exists(id)
@@ -360,12 +402,21 @@ contract ReceivableNote {
         if (payAmount == 0) revert ZeroAmount();
         if (payAmount >= faceValue) revert DiscountTooHigh(payAmount, faceValue);
 
-        // 只动 3 个字段，所以直接写 `_notes[id]`，不取 `Note storage n` 别名。
-        // 对照下面 redeem()：那里要读写 6 个字段，取了 n 更好读。
-        // 两者语义完全等价、gas 只差 26（可忽略），纯粹是可读性选择 —— 详见第 10 讲提问 27。
-        address from = _notes[id].holder;
-        _notes[id].holder = financier;
-        _notes[id].status = Status.Discounted;
+        // 2026-11-11 起要动 4 个字段（跨 2 个 slot），取 `Note storage n` 别名更好读，
+        // 与 USD / Registry 版保持一致。别名 = 门牌号，不是拷贝：写 n 就是写 _notes[id]。
+        // 对照 redeem()：那里字段更多，同样取别名。第 10 讲提问 27 实测两者 gas 只差 26。
+        Note storage n = _notes[id];
+        address from = n.holder;
+        n.holder = financier;
+        n.status = Status.Discounted;
+        n.discountPrice = payAmount;
+
+        // 【把「贴现那一刻的剩余期限」钉住 —— 年化能算对的前提，详见 struct 里这段注释】
+        // 一句话：interest 是贴现日锁死的，`dueDate − now` 是每天在缩的，两者不能配。
+        // 注意必须读 n.dueDate（storage），不能重新算一个 dueDate。
+        uint256 termDays = (n.dueDate - block.timestamp) / 1 days;
+        if (termDays > type(uint16).max) revert TermTooLong(termDays);
+        n.discountTermDays = uint16(termDays);
 
         emit NoteDiscounted(id, from, financier, payAmount, uint64(block.timestamp));
     }
@@ -399,7 +450,20 @@ contract ReceivableNote {
         // 严格大于才算：到期日当天兑付属于正常履约，不该背逾期记录。
         // forge-lint: disable-next-line(block-timestamp) 业务精度是天，验证者只能微调十几秒
         bool isOverDue = block.timestamp > n.dueDate;
+
+        // 计息天数从「合同期限」修正为「实际持有天数」（详见 _actualTermDays）。
+        // ⚠️ 写法有讲究，别改回「在子函数里直接写 storage」：
+        //   `n.status` 和 `n.discountTermDays` 都在 slot1，本该合并成一次 SSTORE。
+        //   但编译器只在**同一作用域内看得见**这两次写、且都能证明必被执行时才合并；
+        //   一旦躲进 private 子函数、子函数里又有 early return，它就老老实实发两次 SSTORE
+        //   （USD 版实测因此多花 2,187 gas）。
+        //   所以这里让子函数只**算**、不写，赋值放在同一作用域里、和 status 相邻。
+        // 用 s == Status.Discounted 而不是 n.discountPrice != 0：前者复用上面刚读的 slot1，
+        //   后者要冷读一次 slot2（+2,100 gas），而在本函数允许的状态范围内两者等价。
+        uint16 newTerm = n.discountTermDays;
+        if (s == Status.Discounted) newTerm = _actualTermDays(n);
         n.status = Status.Redeemed;
+        n.discountTermDays = newTerm;
 
         // 事件放在外部调用之前：万一后续失败，整笔交易连同这条 log 一起回滚，结果等价；
         // 但放在之后会留下「重入时日志顺序错乱」的隐患（forge lint 的 reentrancy-events 就是在报这个）。
@@ -408,6 +472,34 @@ contract ReceivableNote {
         // --- Interactions：最后才动钱 ---
         (bool ok, ) = payee.call{value: amount}("");
         if (!ok) revert EthTransferFailed();
+    }
+
+    /// @dev 算出「实际持有天数」，只计算、不写 storage（写由调用方和 status 合并）。
+    ///      贴现时写入的是合同期限，兑付时用这个值覆盖它，让 discountYieldBps()
+    ///      在兑付后自动变成实际年化 —— 不用链下再从两条日志里算一遍。
+    ///
+    ///      为什么分两个方向写，而不是一句 `term + (now - dueDate) / 1 days`：
+    ///        · 提前兑付时 now < dueDate，无符号相减直接下溢 Panic(0x11)；
+    ///        · 硬转 int256 也能写，但读的人要在大脑里做一次符号推演，还多一层溢出面。
+    ///
+    ///      为什么 early >= term 时归零而不报错：贴现当天就兑付、或贴现时距到期不足一天，
+    ///      实际持有 0 天是**合法的业务事实**（钱当天进当天出）。年化没有分母，
+    ///      discountYieldBps 会因此返回 bps = 0，但 interest 照常给 —— 那是永久事实。
+    ///
+    ///      ⚠️ 精度是天级，且**不可能更准**：存的是 floor((due-disc)/1days)，
+    ///      贴现时刻的秒级余数早已丢失。实测 2 万组随机样本，50.4% 与真值差 1 天。
+    function _actualTermDays(Note storage n) private view returns (uint16) {
+        uint16 term = n.discountTermDays;
+        // forge-lint: disable-next-line(block-timestamp) 业务精度是天
+        if (block.timestamp > n.dueDate) {
+            // 逾期：合同期限 + 超出的整日数
+            uint256 actual = uint256(term) + (block.timestamp - n.dueDate) / 1 days;
+            if (actual > type(uint16).max) revert TermTooLong(actual);
+            return uint16(actual);
+        }
+        // 提前或正点：合同期限 - 提前的整日数，减到 0 为止
+        uint256 early = (n.dueDate - block.timestamp) / 1 days;
+        return early >= term ? 0 : term - uint16(early);
     }
 
     /// @notice 作废：只能在「已开立、未确权」时由核心企业单方作废
@@ -435,6 +527,72 @@ contract ReceivableNote {
         if (n.status != Status.Confirmed && n.status != Status.Discounted) return false;
         // forge-lint: disable-next-line(block-timestamp) 只读视图，业务精度是天，无操纵价值
         return block.timestamp > n.dueDate;
+    }
+
+    /// @notice 贴现息 + 年化贴现率（基点）。第三个返回值告诉你这个 bps 是**哪个口径**。
+    /// @dev 年化 = 贴现息 / 实付金额 × 365 / **计息天数** × 10000
+    ///      分母是 discountTermDays，而这个字段一生有两个值（见 struct 注释）：
+    ///        · 兑付前 = 合同期限（discount() 写入）→ 返回**合同年化**
+    ///        · 兑付后 = 实际持有天数（redeem() 改写）→ 返回**实际年化**
+    ///      所以第三个返回值 isActual 不是锦上添花，是这个函数能不能被用的前提：
+    ///      同样是 1128，isActual=false 时它是"按合同算应该赚多少"，
+    ///      isActual=true 时它是"实际赚了多少"。不告诉调用方，这个数就没法解读。
+    ///
+    ///      为什么两个口径都要：银行提前收到钱 → 实际 > 合同；逾期 → 实际 < 合同。
+    ///      实测（USD 版同款逻辑）：90 天期合同 827 bps，提前 30 天兑付 → 实际 1241 bps。
+    ///      这就是催收的真实动力，也是"合同年化好看、实际年化难看"的常见来源。
+    ///
+    ///      历史背景（2026-11-10 的一次修正，值得记住）：
+    ///      更早的写法用 `dueDate − block.timestamp` 当分母，那个数每天都在缩。
+    ///      固定分子 ÷ 不断缩小的分母 = 一条单调爆炸的曲线。同一张票
+    ///      （票面 100 万 / 实付 97 万 / 90 天期）实测：
+    ///        贴现当天   daysLeft=90 →     1,254 bps（12.5%）   ← 只有这一行是真的
+    ///        贴现后 45 天 daysLeft=45 →     2,508 bps
+    ///        贴现后 88 天 daysLeft= 2 →    56,443 bps
+    ///        贴现后 89 天 daysLeft= 1 →   112,886 bps（1128.9%）
+    ///        到期之后   daysLeft= 0 →         0
+    ///      中间那些数不描述任何真实收益率，只是"假设今天还能用原价买到这张票"的假想值。
+    ///      所以旧写法里除了贴现那一秒，函数的输出都不可用于决策。
+    ///
+    ///      举例：票面 100 万、实付 97 万、期限 90 天 → 息 3 万，
+    ///      年化 = 30000×365×10000/(970000×90) ≈ 1254 bps ≈ 12.54%
+    ///
+    ///      三个数的归属别搞混（以票面 100 万、实付 98 万为例）：
+    ///        amount         = 100 万 → 核心企业欠的钱，到期 redeem 才付
+    ///        discountPrice  =  98 万 → 银行付给持票人的钱，discount 那一刻就出去了（本版走链下）
+    ///        interest       =   2 万 → 银行赚的钱（贴现息），**不是**给供应商的钱
+    ///      算收益率的分母永远是「我掏出去的本金」，也就是 discountPrice。
+    ///
+    ///      bps 是基点：1 bps = 0.01%，10_000 bps = 100%。末尾那个 ×10_000 就是
+    ///      把 0.0827 这种小数放大成整数 827 —— 链上没有浮点，百分比只能这么存。
+    ///
+    ///      本函数一个 block.timestamp 都不用：它只在 discount / redeem 两个时刻写入的
+    ///      分母上做除法，返回的是**定格的事实**，不是实时报价。
+    ///
+    ///      ⚠️ 精度：isActual=true 时，分母是天级近似，约 50% 的情况与真实持有期差 1 天
+    ///      （≈14 bps）。要秒级精确值，用 NoteDiscounted.discountedAt 与
+    ///      NoteRedeemed.redeemedAt 在链下算 —— 那两个时间戳精确到秒。
+    function discountYieldBps(uint256 id)
+        external
+        view
+        returns (uint256 interest, uint256 bps, bool isActual)
+    {
+        Note storage n = _notes[id];
+        if (n.discountPrice == 0) return (0, 0, false); // 从没贴现过
+        interest = n.amount - n.discountPrice;
+        // 兑付后 discountTermDays 已被 redeem() 改写为实际持有天数
+        isActual = n.status == Status.Redeemed;
+        // discountTermDays == 0 的三种情况，语义都不是"计算失败"：
+        //   · 从没贴现 → 上面已 return
+        //   · 贴现时就已不足一天到期 → 期限取整后为 0
+        //   · 贴现当天就兑付 → 实际持有 0 天
+        // 后两种年化没有分母，只能给 (interest, 0)；利息照常给，那是永久事实。
+        if (n.discountTermDays == 0) return (interest, 0, isActual);
+        // 括号不是排版偏好：若按公式字面从左到右写成
+        // interest / discountPrice * 365 / days * 10000，第一刀就被整数除法截成 0。
+        // 乘法全凑到分子、除法只留最后一次。溢出边界：
+        // uint96 上限 × 365 × 10000 ≈ 2.9e35 << uint256 上限 1.16e77，安全。
+        bps = (interest * 365 * 10_000) / (uint256(n.discountPrice) * n.discountTermDays);
     }
 
     /// @dev 刻意不实现 receive()/fallback()。

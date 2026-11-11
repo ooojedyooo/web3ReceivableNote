@@ -66,6 +66,7 @@
 | 30 | 事件里加个时间戳，能不花成本拿到"实际 bps"吗？为什么合约自己读不到事件 | §9.10 末尾·提问 30 |
 | 31 | `discountYieldBps` 的分母为什么不能是"还剩几天到期"？固定分子配缩小的分母等于倒计时 | §9.10 末尾·提问 31 |
 | 32 | `discountTermDays` 该在 settle 时改成实际天数吗？那个 `NotDue` 是不是让逾期的票永远结不了 | §9.10 末尾·提问 32 |
+| 33 | 这套设计能直接抄到 ETH 版吗？为什么补 `discountYieldBps` 之前必须先补一个字段 | §9.10 末尾·提问 33 |
 
 ---
 
@@ -3601,6 +3602,92 @@ function discountYieldBps(uint256 id)
 ##### 七、一句话收口
 
 **`isOverDue` 那一行是免费的确定性；`discountTermDays` 的改写在 gas 上几乎免费（+1,011 / 77,923 ≈ 1.3%），代价是 50% 概率差 1 天 —— 换来"结算后链上直接能查实际年化"这件事，值。**
+
+---
+
+#### ❓ 提问 33：这套 `discountTermDays` / `isOverDue` / `discountYieldBps` 能直接抄到 ETH 版吗？
+
+> 用户原话：「根据这个最新的 ReceivableNoteRegistry.sol 版本，给另外两个里面关于 discountTermDays、isOverDue、function discountYieldBps(uint256 id) 这些都给补齐吧」
+
+USD 版早就有了（它就是这轮设计的试验田）。**ETH 版抄不过去** —— 不是排版问题，是少一个字段。
+
+##### 一、ETH 版缺的不是函数，是分子
+
+三个合约的 `struct Note` 摆在一起看：
+
+| 字段 | ETH | USD | Registry |
+|---|---|---|---|
+| `discountTermDays` | ❌ | ✅ | ✅ |
+| `discountPrice` | **❌** | ✅ | ✅ |
+
+前一版 ETH 版**故意不存 `discountPrice`**，理由是自洽的：这一版贴现走链下，`payAmount` 只进 `NoteDiscounted` 事件，不落 storage —— 省一次 SSTORE。
+
+但年化的第一个式子是：
+
+```solidity
+interest = n.amount - n.discountPrice;   // 息
+```
+
+`discountPrice` 不在 storage 里，这个减法就写不出来。**所以「补 `discountYieldBps`」的真实含义是「先补一个 `discountPrice` 字段」**，然后函数才有东西可算。
+
+##### 二、加字段，但一个槽都没多占
+
+ETH 版原来的布局（`forge inspect` 实测）：
+
+```
+slot0: issuer(20) + amount(12)              = 32  满
+slot1: holder(20) + dueDate(8) + status(1)  = 29  剩 3 字节
+slot2: supplier(20)                          = 20  剩 12 字节 ← 因为后面跟 bytes32 放不下，它只能独占开头
+slot3: invoiceHash(32)
+```
+
+两个新字段正好补进两个空位：
+
+```
+slot1: … + discountTermDays(uint16, 2B) = 31  剩 1
+slot2: supplier(20) + discountPrice(uint96, 12B) = 32  满
+```
+
+改完仍是 **128 字节 / 4 个槽**，与改前完全一致。`discountPrice` 没花那 20,000 gas 的新槽钱。
+
+##### 三、但「不花新槽钱」≠「不花写钱」
+
+新字段第一次被写，总是要付 SSTORE 的。实测快照：
+
+| 函数 | 改前 | 改后 | 增量 | 花在哪 |
+|---|---|---|---|---|
+| `eth.discount` | 36,146 | **41,709** | **+5,563** | slot2 一次冷写：2,100(冷访问)+2,900(非零→非零) |
+| `eth.redeem` | 74,260 | **75,168** | +908 | `_actualTermDays` 计算 + term 改写（与 status 同槽，合并了） |
+| `eth.issue` | 145,639 | 146,089 | +450 | 部署字节码大 1,167B 的分摊，不是写入 |
+| `eth.confirm` | 29,788 | 29,800 | +12 | 同上的分摊 |
+
+**+5,563 这个数要认下来**：它是「贴现价上链留档」的价格，不是布局没算好的结果。之前省掉它，是因为那时这个数只被事件用到；现在要参与计算，就得付。
+
+> 判断标准还是那句：**会被反复查询、且要参与计算的字段才值得落 storage**。只给链下看、永不回合约的，放事件（313 gas）；要进公式的，只能放 storage。
+
+##### 四、一个复制粘贴不会提醒你的坑：两版 ABI 顺序不一样
+
+同样是 4 个槽，字段顺序却不同（因为 ETH 版是被布局逼出来的）：
+
+```
+ETH：… status, discountTermDays, supplier, discountPrice, invoiceHash
+USD：… status, discountTermDays, discountPrice, supplier, invoiceHash
+```
+
+**ABI 编码按声明顺序走，跟槽位顺序无关。** 所以 `getNote()` 返回的 tuple，两版按位置解码的结果完全不同 —— 拿同一份链下代码去解三个合约，`supplier` 会解成 `discountPrice` 的地址（`uint96` 被读成 20 字节地址），而且不会报错，只是数字全错。
+
+这就是 `demo-local.sh` 里那段 python 索引必须跟着改的原因（`words[5]` → `words[6]`、`words[6]` → `words[8]`）。顺带把两个新字段也打印出来了，等于白送一行「贴现收益 + 年化 bps」。
+
+##### 五、ETH 版补完之后，三版才真正对齐
+
+| 能力 | ETH | USD | Registry |
+|---|---|---|---|
+| 贴现息可查 | ✅ | ✅ | ✅ |
+| 合同年化（幂等） | ✅ | ✅ | ✅ |
+| 结算后自动转实际年化 | ✅ | ✅ | ✅ |
+| 钱走链上 | ✅ msg.value | ✅ transferFrom | ❌ 存证 |
+
+一句话：**ETH 版补的不是一个查询函数，是「贴现条款在链上留档」这一件事。** 之前它的贴现只留了一条日志，现在留下一份能参与后续计算的档案。
 
 ---
 

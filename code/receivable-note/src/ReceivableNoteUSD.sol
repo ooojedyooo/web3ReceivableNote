@@ -88,10 +88,16 @@ contract ReceivableNoteUSD {
             // 两次取整的余数叠加 —— 实测 2 万组随机样本 50.4% 与真值差 1 天（最大 1 天）。
             // 1 天 ≈ 14 bps（90 天期、1254 bps 口径）。精确值用两条事件的秒级时间戳在链下算。
         uint96 discountPrice; // 贴现实收金额（0 表示未贴现）。财务要用它算贴现息
-            // 为什么 ETH 版没有这个字段：ETH 版只在事件 NoteDiscounted 里记了 payAmount，
-            // 那个值不落 storage，事后想查贴现息只能翻日志。这一版落进了 struct，
-            // 代价是多占 12 字节，收益是 discountYieldBps() 这种只读函数能直接读出来。
-            // 取舍标准：会被反复查询、且需要参与计算的字段才值得落 storage。
+            // 为什么必须落 storage 而不是只发事件：它是 discountYieldBps() 的分子来源
+            // （息 = amount − discountPrice）。事件里的 payAmount 只有链下能看，
+            // 合约自己永远读不回来 —— LOG 是只写出口。要用它参与计算，就只能存下来。
+            //
+            // ⚠️ 字段位置与 ETH 版**不同**：本版 discountPrice 在 supplier 之前，
+            //    ETH 版是 supplier 在前。两版都只占一个槽（12 + 20 = 32），
+            //    但 getNote() 返回的 tuple 顺序因此不一样（ABI 按声明顺序编码，与槽位无关），
+            //    链下按位置解 tuple 时不能共用同一份解码代码。差异是布局逼出来的：
+            //    ETH 版原 struct 里 supplier 后面紧跟 bytes32 放不下，supplier 只能独占 slot2 开头，
+            //    于是 12 字节的 discountPrice 只能排在它后面补满。
         address supplier; // 原始债权人（不可变，审计追溯用）
         bytes32 invoiceHash; // 发票号哈希（不存明文 —— 第 1 讲的原则：链上数据永久公开）
     }
